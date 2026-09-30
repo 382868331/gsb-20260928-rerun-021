@@ -1,18 +1,14 @@
 import math
 from dataclasses import dataclass
 
-from .math_utils import lerp, smoothstep
-from .math_utils import clamp
+from .math_utils import clamp, lerp, smoothstep
 from .pose import Pose
 
-_GAUSS_NODES = (
-    0.046910077030668, 0.230765344947157, 0.5, 0.769234655052843,
-    0.953089922969332,
-)
-_GAUSS_WEIGHTS = (
-    0.118463442528095, 0.239314335249683, 0.284444444444444,
-    0.239314335249683, 0.118463442528095,
-)
+
+def _canonical_loop_time(clip, local_time: float) -> float:
+    if clip.loop:
+        return local_time % clip.duration
+    return clamp(local_time, 0.0, clip.duration)
 
 
 @dataclass
@@ -47,6 +43,7 @@ class AnimationPlayer:
             clip_name=clip_name, root_position=tuple(root_position)
         )
         self._pending_events = []
+        self._contact_records = []
 
     @property
     def clip(self):
@@ -80,13 +77,23 @@ class AnimationPlayer:
                       entry_time: float = 0.0, sync_marker: str = None):
         if clip_name == self.state.clip_name and not self.state.is_blending:
             return
+        source_clip = self.clip
+        source_time = self.state.local_time
         snapshot = self.current_pose()
-        self.state.clip_name = clip_name
         target_clip = self.library[clip_name]
+        source_contact = None
+        target_contact = None
         if sync_marker is not None:
             entry_time = target_clip.sync_time(
-                sync_marker, self.state.local_time
+                sync_marker, source_clip, self.state.local_time
             )
+            source_contact = self._contact_state(
+                source_clip, sync_marker, self.state.local_time
+            )
+            target_contact = self._contact_state(
+                target_clip, sync_marker, entry_time
+            )
+        self.state.clip_name = clip_name
         self.state.local_time = entry_time
         self.state.blend_elapsed = 0.0
         self.state.blend_duration = max(0.0, duration)
@@ -98,6 +105,34 @@ class AnimationPlayer:
         # replayed through the target cursor; already queued events survive.
         self.state.generation += 1
         self.state.fired_events = ()
+        self._contact_records.append(
+            {
+                "index": len(self._contact_records),
+                "source_clip": source_clip.name,
+                "target_clip": target_clip.name,
+                "marker": sync_marker,
+                "source_local_time": _canonical_loop_time(source_clip, source_time),
+                "target_local_time": entry_time,
+                "before": source_contact,
+                "after": target_contact,
+            }
+        )
+
+    def _contact_state(self, clip, marker_name: str, local_time: float):
+        marker = clip.marker(marker_name)
+        phase = clip.marker_phase(marker_name, local_time)
+        return {
+            "clip": clip.name,
+            "local_time": _canonical_loop_time(clip, local_time),
+            "marker": marker_name,
+            "phase": phase,
+            "payload": marker.payload,
+            "grounded": math.isclose(phase, 0.0, abs_tol=1e-12),
+        }
+
+    def contact_records(self):
+        """Read-only replay log of contact state around each transition."""
+        return [dict(record) for record in self._contact_records]
 
     def seek(self, local_time: float):
         """Jump the cursor without blending or emitting events.
@@ -159,60 +194,98 @@ class AnimationPlayer:
         st.local_time = end
         return dx, dy, dh
 
-    def _velocity_breaks(self, clip, t0: float, dt: float):
+    def _keyframe_breaks(self, clip, t0: float, dt: float):
         end = t0 + dt
-        breaks = {0.0, dt}
+        breaks = {0.0}
         for frame in clip.keyframes:
             marker = frame.t
             if clip.loop:
-                first = ((t0 - marker) // clip.duration + 1) * clip.duration + marker
+                first = t0 + ((marker - t0) % clip.duration)
                 boundary = first
                 while boundary < end - 1e-12:
                     if boundary > t0 + 1e-12:
                         breaks.add(boundary - t0)
                     boundary += clip.duration
-            elif t0 < marker < end:
+            elif marker > 0.0 and t0 < marker <= end:
                 breaks.add(marker - t0)
-        blend_end = self.state.blend_duration - self.state.blend_elapsed
-        if 0.0 < blend_end < dt:
-            breaks.add(blend_end)
-        return sorted(breaks)
+        return breaks
 
     def _frozen_weight_integral(self, start: float, end: float) -> float:
         st = self.state
         duration = st.blend_duration
 
-        def primitive(offset: float) -> float:
-            x = (st.blend_elapsed + offset) / duration
+        def primitive(u: float) -> float:
+            x = u / duration
             return x - (x ** 3 - 0.5 * x ** 4)
 
         return duration * (primitive(end) - primitive(start))
 
-    def _integrate_blend(self, clip, t0: float, start: float, span: float):
+    def _target_weight_integrals(self, start: float, end: float):
         st = self.state
-        sums = [0.0, 0.0, 0.0]
-        for node, weight in zip(_GAUSS_NODES, _GAUSS_WEIGHTS):
-            offset = start + node * span
-            pose = clip.sample(t0 + offset)
-            alpha = (st.blend_elapsed + offset) / st.blend_duration
-            blend_weight = smoothstep(alpha)
-            values = (
-                pose.root_velocity[0],
-                pose.root_velocity[1],
-                pose.omega,
-            )
-            for i, value in enumerate(values):
-                sums[i] += weight * blend_weight * value * span
+        duration = st.blend_duration
 
-        frozen_scale = self._frozen_weight_integral(start, end=start + span)
-        return (
-            st.frozen_velocity[0] * frozen_scale + sums[0],
-            st.frozen_velocity[1] * frozen_scale + sums[1],
-            st.frozen_omega * frozen_scale + sums[2],
+        def weighted_time(u: float) -> float:
+            return (
+                0.75 * u ** 4 / duration ** 2
+                - 0.4 * u ** 5 / duration ** 3
+            )
+
+        def weighted_area(u: float) -> float:
+            x = u / duration
+            return duration * (x ** 3 - 0.5 * x ** 4)
+
+        area = weighted_area(end) - weighted_area(start)
+        moment = weighted_time(end) - weighted_time(start)
+        return area, moment
+
+    def _integrate_blend(self, clip, t0: float, clip_dt: float,
+                         wall_dt: float, frozen_velocity, frozen_omega):
+        st = self.state
+        breaks = sorted({0.0, clip_dt, *(
+            value for value in self._keyframe_breaks(clip, t0, clip_dt)
+            if 0.0 < value < clip_dt
+        )})
+        frozen_scale = self._frozen_weight_integral(
+            st.blend_elapsed, st.blend_elapsed + wall_dt
         )
+        result = [0.0, 0.0, 0.0]
+        result[0] += frozen_velocity[0] * frozen_scale
+        result[1] += frozen_velocity[1] * frozen_scale
+        result[2] += frozen_omega * frozen_scale
+        for clip_start, clip_end in zip(breaks, breaks[1:]):
+            wall_start = clip_start / st.speed
+            wall_end = clip_end / st.speed
+            area, absolute_moment = self._target_weight_integrals(
+                st.blend_elapsed + wall_start,
+                st.blend_elapsed + wall_end,
+            )
+            relative_moment = (
+                absolute_moment - (
+                    st.blend_elapsed + wall_start
+                ) * area
+            )
+            relative_moment *= st.speed
+            pose0 = clip.sample(t0 + clip_start)
+            pose1 = clip.sample(t0 + clip_end)
+            values = (
+                pose0.root_velocity[0],
+                pose0.root_velocity[1],
+                pose0.omega,
+            )
+            slopes = (
+                (pose1.root_velocity[0] - pose0.root_velocity[0])
+                / (clip_end - clip_start),
+                (pose1.root_velocity[1] - pose0.root_velocity[1])
+                / (clip_end - clip_start),
+                (pose1.omega - pose0.omega)
+                / (clip_end - clip_start),
+            )
+            for i in range(3):
+                result[i] += values[i] * area + slopes[i] * relative_moment
+        return tuple(result)
 
     def update(self, dt: float):
-        if dt == 0.0:
+        if dt == 0.0 or dt * self.state.speed == 0.0:
             return self.current_pose()
 
         st = self.state
@@ -230,21 +303,41 @@ class AnimationPlayer:
             st.frozen_omega = 0.0
 
         if st.is_blending and effective_dt >= 0.0:
-            blended_dt = min(effective_dt, st.blend_duration - st.blend_elapsed)
-            tail_dt = effective_dt - blended_dt
-            breaks = self._velocity_breaks(clip, st.local_time, blended_dt)
-            for start, end in zip(breaks, breaks[1:]):
-                move = self._integrate_blend(
-                    clip, st.local_time, start, end - start
+            wall_blend_dt = min(
+                dt, st.blend_duration - st.blend_elapsed
+            )
+            active_clip_dt = wall_blend_dt * st.speed
+            active_wall_dt = wall_blend_dt
+            if not clip.loop:
+                active_clip_dt = min(
+                    active_clip_dt, clip.duration - st.local_time
                 )
-                dx += move[0]
-                dy += move[1]
-                dh += move[2]
+                active_wall_dt = active_clip_dt / st.speed
+            move = self._integrate_blend(
+                clip,
+                st.local_time,
+                active_clip_dt,
+                active_wall_dt,
+                st.frozen_velocity,
+                st.frozen_omega,
+            )
+            dx += move[0]
+            dy += move[1]
+            dh += move[2]
 
-            blend_end_time = st.local_time + blended_dt
+            blend_end_time = st.local_time + active_clip_dt
             self._collect_events(clip, st.local_time, blend_end_time)
             st.local_time = blend_end_time
-            st.blend_elapsed += blended_dt
+            st.blend_elapsed += active_wall_dt
+            pose_only_dt = wall_blend_dt - active_wall_dt
+            st.blend_elapsed += pose_only_dt
+            if st.blend_elapsed >= st.blend_duration:
+                st.blend_elapsed = 0.0
+                st.blend_duration = 0.0
+                st.frozen_joints = None
+                st.frozen_velocity = None
+                st.frozen_omega = 0.0
+            tail_dt = effective_dt - wall_blend_dt * st.speed
             if tail_dt > 0.0:
                 tail_start = st.local_time
                 move = clip.integrate_root(tail_start, tail_dt)
@@ -256,12 +349,6 @@ class AnimationPlayer:
                 if not clip.loop:
                     tail_end = clamp(tail_end, 0.0, clip.duration)
                 st.local_time = tail_end
-            if st.blend_elapsed >= st.blend_duration:
-                st.blend_elapsed = 0.0
-                st.blend_duration = 0.0
-                st.frozen_joints = None
-                st.frozen_velocity = None
-                st.frozen_omega = 0.0
         else:
             dx, dy, dh = self._advance_without_blend(clip, effective_dt)
 
@@ -303,6 +390,7 @@ class AnimationPlayer:
             "generation": st.generation,
             "fired_events": [list(key) for key in st.fired_events],
             "pending_events": list(self._pending_events),
+            "contact_records": self.contact_records(),
         }
 
     def load_state(self, data: dict):
@@ -323,3 +411,6 @@ class AnimationPlayer:
             ),
         )
         self._pending_events = list(data.get("pending_events", []))
+        self._contact_records = [
+            dict(record) for record in data.get("contact_records", [])
+        ]

@@ -57,18 +57,39 @@ class AnimationClip:
                 return marker
         raise KeyError(f"clip {self.name!r} has no marker {name!r}")
 
-    def sync_time(self, marker_name: str, current_time: float) -> float:
-        """Target local time that aligns ``marker_name`` with ``current_time``.
-
-        For looping clips the occurrence nearest to ``current_time`` is used,
-        so walk -> run can align the grounded-foot phase without a time jump.
-        Non-looping clips simply start at the tagged time.
-        """
+    def marker_phase(self, marker_name: str, current_time: float) -> float:
+        """Normalized position after the most recent marker occurrence."""
         marker = self.marker(marker_name)
-        if not self.loop:
-            return marker.t
-        k = round((current_time - marker.t) / self.duration)
-        return k * self.duration + marker.t
+        if self.loop:
+            return ((current_time - marker.t) % self.duration) / self.duration
+        if current_time <= marker.t:
+            return 0.0
+        if self.duration == marker.t:
+            return 1.0
+        return min(1.0, (current_time - marker.t) / (self.duration - marker.t))
+
+    def sync_time(self, marker_name, source_clip=None, current_time=None):
+        """Target time preserving progress through the named contact phase.
+
+        Two looping clips can use different durations.  The fractional
+        distance from the source marker is mapped onto the target cycle,
+        rather than snapping the cursor onto a marker.  The result uses the
+        positive phase representative, which gives the same distance back to
+        the previous marker during reverse playback as forward playback gives
+        to the next cyclic occurrence.
+        """
+        if isinstance(source_clip, (int, float)):
+            current_time = source_clip
+            source_clip = self
+        if source_clip is None:
+            source_clip = self
+        if current_time is None:
+            current_time = 0.0
+        target_marker = self.marker(marker_name)
+        if not self.loop or not getattr(source_clip, "loop", False):
+            return target_marker.t
+        phase = source_clip.marker_phase(marker_name, current_time)
+        return (target_marker.t + phase * self.duration) % self.duration
 
     def crossed_markers(self, t0: float, t1: float):
         """Marker occurrences crossed while moving forward t0 -> t1.

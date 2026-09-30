@@ -94,6 +94,71 @@ class EngineTests(unittest.TestCase):
                         restored.current_pose().joints):
             self.assertAlmostEqual(a, b, places=10)
 
+    def test_interrupted_blend_speed_change_matches_frames_and_restore(self):
+        library = build_demo_library()
+        states = [State("walk"), State("run"), State("attack")]
+
+        def build_scenario():
+            animator = CharacterAnimator(library, "walk", states)
+            animator.request_transition("run", 0.4, sync_marker="foot_down")
+            animator.update(0.1)
+            animator.request_transition("attack", 0.3)
+            animator.player.state.speed = 2.0
+            return animator
+
+        big = build_scenario()
+        stepped = build_scenario()
+        restorable = build_scenario()
+
+        for _ in range(6):
+            stepped.update(0.02)
+            restorable.update(0.02)
+        snapshot = restorable.save_state()
+
+        for _ in range(6):
+            big.update(0.02)
+        big.update(0.38)
+        big_events = [(event["clip"], event["marker"], event["cycle"])
+                      for event in big.pop_events()]
+        stepped_events = []
+        for _ in range(19):
+            stepped.update(0.02)
+            stepped_events.extend(stepped.pop_events())
+        stepped_events = [(event["clip"], event["marker"], event["cycle"])
+                          for event in stepped_events]
+
+        restorable.load_state(snapshot)
+        for _ in range(19):
+            restorable.update(0.02)
+        restored_events = [(event["clip"], event["marker"], event["cycle"])
+                           for event in restorable.pop_events()]
+
+        self.assertEqual(big_events, stepped_events)
+        self.assertEqual(big_events, restored_events)
+        self.assertEqual([event[1] for event in big_events], ["windup", "hit"])
+        self.assertAlmostEqual(
+            big.player.state.local_time, stepped.player.state.local_time, places=10
+        )
+        self.assertAlmostEqual(
+            big.player.state.local_time,
+            restorable.player.state.local_time,
+            places=10,
+        )
+        for axis in range(2):
+            self.assertAlmostEqual(
+                big.root_position[axis],
+                stepped.root_position[axis],
+                places=10,
+            )
+            self.assertAlmostEqual(
+                big.root_position[axis],
+                restorable.root_position[axis],
+                places=10,
+            )
+        for expected, actual in zip(big.current_pose().joints,
+                                    stepped.current_pose().joints):
+            self.assertAlmostEqual(expected, actual, places=10)
+
     def test_conditional_transition(self):
         library = build_demo_library()
         animator = CharacterAnimator(

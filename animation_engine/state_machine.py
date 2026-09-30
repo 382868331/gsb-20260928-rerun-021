@@ -100,6 +100,9 @@ class CharacterAnimator:
     def pop_events(self):
         return self.player.pop_events()
 
+    def contact_records(self):
+        return self.player.contact_records()
+
     def save_state(self) -> dict:
         return {
             "current_state": self.current_state,

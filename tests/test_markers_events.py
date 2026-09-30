@@ -20,15 +20,90 @@ def _attack_animator(library):
 
 
 class MarkerSyncTests(unittest.TestCase):
-    def test_loop_sync_picks_nearest_tagged_phase(self):
+    def test_loop_sync_preserves_offset_from_tagged_phase(self):
         library = build_demo_library()
         animator = CharacterAnimator(
             library, "walk", [State("walk"), State("run")]
         )
         animator.update(0.63)
         animator.request_transition("run", 0.3, sync_marker="foot_down")
-        # Nearest run foot-down occurrence to walk time 0.63 is t=1.0.
-        self.assertAlmostEqual(animator.player.state.local_time, 1.0)
+        self.assertAlmostEqual(animator.player.state.local_time, 0.63)
+
+    def test_loop_sync_scales_phase_offset_across_durations(self):
+        walk = AnimationClip(
+            "walk",
+            [Keyframe(0.0, (0.0,)), Keyframe(1.0, (1.0,))],
+            loop=True,
+            markers=[Marker(0.0, "foot_down")],
+        )
+        run = AnimationClip(
+            "run",
+            [Keyframe(0.0, (0.0,)), Keyframe(2.0, (2.0,))],
+            loop=True,
+            markers=[Marker(0.0, "foot_down")],
+        )
+        animator = CharacterAnimator(
+            {"walk": walk, "run": run},
+            "walk",
+            [State("walk"), State("run")],
+        )
+        animator.update(0.63)
+        animator.request_transition("run", 0.2, sync_marker="foot_down")
+        self.assertAlmostEqual(animator.player.state.local_time, 1.26)
+
+    def test_loop_sync_wraps_phase_after_nonzero_marker(self):
+        walk = AnimationClip(
+            "walk",
+            [Keyframe(0.0, (0.0,)), Keyframe(1.0, (1.0,))],
+            loop=True,
+            markers=[Marker(0.8, "foot_down")],
+        )
+        run = AnimationClip(
+            "run",
+            [Keyframe(0.0, (0.0,)), Keyframe(2.0, (2.0,))],
+            loop=True,
+            markers=[Marker(1.6, "foot_down")],
+        )
+        animator = CharacterAnimator(
+            {"walk": walk, "run": run},
+            "walk",
+            [State("walk"), State("run")],
+        )
+        animator.update(0.9)
+        animator.request_transition("run", 0.0, sync_marker="foot_down")
+        self.assertAlmostEqual(animator.player.state.local_time, 1.8)
+
+    def test_loop_sync_has_same_phase_in_reverse_at_boundary(self):
+        library = build_demo_library()
+        animator = CharacterAnimator(
+            library, "walk", [State("walk"), State("run")]
+        )
+        animator.update(0.98)
+        animator.request_transition("run", 0.0, sync_marker="foot_down")
+        self.assertAlmostEqual(animator.player.state.local_time, 0.98)
+        animator.player.state.speed = -1.0
+        animator.update(0.96)
+        self.assertAlmostEqual(animator.player.state.local_time % 1.0, 0.02)
+        self.assertEqual(animator.pop_events(), [])
+
+    def test_transition_records_contact_phase_before_and_after(self):
+        library = build_demo_library()
+        animator = CharacterAnimator(
+            library, "walk", [State("walk"), State("run")]
+        )
+        animator.update(0.63)
+        animator.request_transition("run", 0.3, sync_marker="foot_down")
+        record = animator.contact_records()[-1]
+        self.assertEqual(record["before"]["clip"], "walk")
+        self.assertEqual(record["after"]["clip"], "run")
+        self.assertAlmostEqual(record["before"]["phase"], 0.63)
+        self.assertAlmostEqual(record["after"]["phase"], 0.63)
+        self.assertFalse(record["before"]["grounded"])
+        restored = CharacterAnimator(
+            library, "walk", [State("walk"), State("run")]
+        )
+        restored.load_state(animator.save_state())
+        self.assertEqual(restored.contact_records(), animator.contact_records())
 
     def test_sync_does_not_replay_entry_marker_at_time_zero(self):
         library = build_demo_library()
