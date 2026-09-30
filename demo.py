@@ -103,6 +103,20 @@ def main():
     print(f"saved/restored independent sampling matches: {match}")
     print(f"final root: {animator.root_position}")
 
+    # Marker-synchronised switch and one-shot external events.
+    synced = CharacterAnimator(
+        library,
+        "walk",
+        states=[State("walk"), State("run"), State("attack")],
+    )
+    synced.update(0.63)
+    synced.request_transition("run", duration=0.2, sync_marker="foot_down")
+    synced.update(0.2)
+    synced.request_transition("attack", duration=0.0)
+    synced.update(0.6)  # single big step crosses windup then hit
+    print(f"marker-synced run entry local time: {synced.player.state.local_time:.3f}")
+    print(f"attack events: {[e['marker'] for e in synced.pop_events()]}")
+
 
 if __name__ == "__main__":
     main()

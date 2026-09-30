@@ -56,12 +56,15 @@ class CharacterAnimator:
         self.transitions.setdefault(transition.source, []).append(transition)
 
     def request_transition(self, destination: str, duration: float,
-                          entry_time: float = 0.0) -> bool:
+                          entry_time: float = 0.0,
+                          sync_marker: str = None) -> bool:
         if destination not in self.states:
             return False
         target = self.states[destination]
         self.current_state = destination
-        self.player.transition_to(target.clip_name, duration, entry_time)
+        self.player.transition_to(
+            target.clip_name, duration, entry_time, sync_marker
+        )
         self.player.state.speed = target.speed
         return True
 
@@ -90,6 +93,12 @@ class CharacterAnimator:
 
     def current_pose(self):
         return self.player.current_pose()
+
+    def seek(self, local_time: float):
+        return self.player.seek(local_time)
+
+    def pop_events(self):
+        return self.player.pop_events()
 
     def save_state(self) -> dict:
         return {

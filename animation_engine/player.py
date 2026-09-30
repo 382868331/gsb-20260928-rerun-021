@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 from .math_utils import lerp, smoothstep
+from .math_utils import clamp
 from .pose import Pose
 
 _GAUSS_NODES = (
@@ -26,6 +27,11 @@ class PlaybackState:
     frozen_joints: tuple = None
     frozen_velocity: tuple = None
     frozen_omega: float = 0.0
+    # Bumped on every (re)entry into a clip; together with the marker name
+    # and loop-cycle index it uniquely identifies an event occurrence.
+    generation: int = 0
+    # Occurrence keys that have already fired during this play-through.
+    fired_events: tuple = ()
 
     @property
     def is_blending(self) -> bool:
@@ -40,6 +46,7 @@ class AnimationPlayer:
         self.state = PlaybackState(
             clip_name=clip_name, root_position=tuple(root_position)
         )
+        self._pending_events = []
 
     @property
     def clip(self):
@@ -69,17 +76,88 @@ class AnimationPlayer:
         )
         return Pose(joints, velocity, lerp(st.frozen_omega, target.omega, weight))
 
-    def transition_to(self, clip_name: str, duration: float, entry_time: float = 0.0):
+    def transition_to(self, clip_name: str, duration: float,
+                      entry_time: float = 0.0, sync_marker: str = None):
         if clip_name == self.state.clip_name and not self.state.is_blending:
             return
         snapshot = self.current_pose()
         self.state.clip_name = clip_name
+        target_clip = self.library[clip_name]
+        if sync_marker is not None:
+            entry_time = target_clip.sync_time(
+                sync_marker, self.state.local_time
+            )
         self.state.local_time = entry_time
         self.state.blend_elapsed = 0.0
         self.state.blend_duration = max(0.0, duration)
         self.state.frozen_joints = snapshot.joints
         self.state.frozen_velocity = snapshot.root_velocity
         self.state.frozen_omega = snapshot.omega
+        # Switching clips starts a fresh play-through for the new clip. The
+        # old clip's not-yet-reached markers are cancelled rather than
+        # replayed through the target cursor; already queued events survive.
+        self.state.generation += 1
+        self.state.fired_events = ()
+
+    def seek(self, local_time: float):
+        """Jump the cursor without blending or emitting events.
+
+        Markers inside the skipped region are treated as neither fired nor
+        pending: a jump never synthesises events. Fired occurrences stay
+        fired, so seeking back and moving forward again does not replay
+        them. Any in-progress blend is cancelled.
+        """
+        clip = self.clip
+        st = self.state
+        if not clip.loop:
+            local_time = clamp(local_time, 0.0, clip.duration)
+        st.local_time = local_time
+        st.blend_elapsed = 0.0
+        st.blend_duration = 0.0
+        st.frozen_joints = None
+        st.frozen_velocity = None
+        st.frozen_omega = 0.0
+
+    def queue_event(self, name: str, payload, cycle: int):
+        st = self.state
+        key = (st.generation, name, cycle)
+        fired = set(st.fired_events)
+        if key in fired:
+            return
+        fired.add(key)
+        st.fired_events = tuple(sorted(fired))
+        self._pending_events.append(
+            {
+                "clip": st.clip_name,
+                "marker": name,
+                "cycle": cycle,
+                "payload": payload,
+            }
+        )
+
+    def pop_events(self):
+        """Return and clear external events produced since the last call."""
+        events = self._pending_events
+        self._pending_events = []
+        return events
+
+    def _collect_events(self, clip, t0: float, t1: float):
+        for _, cycle, marker in clip.crossed_markers(t0, t1):
+            self.queue_event(marker.name, marker.payload, cycle)
+
+    def _advance_without_blend(self, clip, effective_dt: float):
+        st = self.state
+        start = st.local_time
+        dx, dy, dh = clip.integrate_root(start, effective_dt)
+        end = start + effective_dt
+        if effective_dt > 0.0:
+            self._collect_events(clip, start, end)
+        # Reverse playback never fires events; moving backwards only rewinds
+        # pose and root channels.
+        if not clip.loop:
+            end = clamp(end, 0.0, clip.duration)
+        st.local_time = end
+        return dx, dy, dh
 
     def _velocity_breaks(self, clip, t0: float, dt: float):
         end = t0 + dt
@@ -134,8 +212,6 @@ class AnimationPlayer:
         )
 
     def update(self, dt: float):
-        if dt < 0.0:
-            raise ValueError("playback cannot move backwards")
         if dt == 0.0:
             return self.current_pose()
 
@@ -144,7 +220,16 @@ class AnimationPlayer:
         clip = self.clip
         dx = dy = dh = 0.0
 
-        if st.is_blending:
+        if effective_dt < 0.0 and st.is_blending:
+            # Reverse is an explicit rule change: cancel the blend and move
+            # the target clip backwards. No events fire while rewinding.
+            st.blend_elapsed = 0.0
+            st.blend_duration = 0.0
+            st.frozen_joints = None
+            st.frozen_velocity = None
+            st.frozen_omega = 0.0
+
+        if st.is_blending and effective_dt >= 0.0:
             blended_dt = min(effective_dt, st.blend_duration - st.blend_elapsed)
             tail_dt = effective_dt - blended_dt
             breaks = self._velocity_breaks(clip, st.local_time, blended_dt)
@@ -156,14 +241,21 @@ class AnimationPlayer:
                 dy += move[1]
                 dh += move[2]
 
-            st.local_time += blended_dt
+            blend_end_time = st.local_time + blended_dt
+            self._collect_events(clip, st.local_time, blend_end_time)
+            st.local_time = blend_end_time
             st.blend_elapsed += blended_dt
             if tail_dt > 0.0:
-                move = clip.integrate_root(st.local_time, tail_dt)
+                tail_start = st.local_time
+                move = clip.integrate_root(tail_start, tail_dt)
                 dx += move[0]
                 dy += move[1]
                 dh += move[2]
-                st.local_time += tail_dt
+                tail_end = tail_start + tail_dt
+                self._collect_events(clip, tail_start, tail_end)
+                if not clip.loop:
+                    tail_end = clamp(tail_end, 0.0, clip.duration)
+                st.local_time = tail_end
             if st.blend_elapsed >= st.blend_duration:
                 st.blend_elapsed = 0.0
                 st.blend_duration = 0.0
@@ -171,8 +263,7 @@ class AnimationPlayer:
                 st.frozen_velocity = None
                 st.frozen_omega = 0.0
         else:
-            dx, dy, dh = clip.integrate_root(st.local_time, effective_dt)
-            st.local_time += effective_dt
+            dx, dy, dh = self._advance_without_blend(clip, effective_dt)
 
         world_dx, world_dy = self._local_to_world_displacement(
             st.root_heading, dx, dy, dh
@@ -209,6 +300,9 @@ class AnimationPlayer:
             "frozen_joints": st.frozen_joints,
             "frozen_velocity": st.frozen_velocity,
             "frozen_omega": st.frozen_omega,
+            "generation": st.generation,
+            "fired_events": [list(key) for key in st.fired_events],
+            "pending_events": list(self._pending_events),
         }
 
     def load_state(self, data: dict):
@@ -223,4 +317,9 @@ class AnimationPlayer:
             frozen_joints=data["frozen_joints"],
             frozen_velocity=data["frozen_velocity"],
             frozen_omega=data["frozen_omega"],
+            generation=data.get("generation", 0),
+            fired_events=tuple(
+                tuple(key) for key in data.get("fired_events", ())
+            ),
         )
+        self._pending_events = list(data.get("pending_events", []))

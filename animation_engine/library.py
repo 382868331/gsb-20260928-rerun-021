@@ -1,4 +1,4 @@
-from .clip import AnimationClip, Keyframe
+from .clip import AnimationClip, Keyframe, Marker
 
 
 def build_demo_library():
@@ -25,6 +25,7 @@ def build_demo_library():
                 Keyframe(1.0, (0.5, -0.5), (1.0, 0.0)),
             ],
             loop=True,
+            markers=[Marker(0.0, "foot_down", {"foot": "left"})],
         ),
         "run": AnimationClip(
             "run",
@@ -34,6 +35,7 @@ def build_demo_library():
                 Keyframe(1.0, (0.8, -0.8), (3.0, 0.0)),
             ],
             loop=True,
+            markers=[Marker(0.0, "foot_down", {"foot": "left"})],
         ),
         # Short one-shot action, intentionally started while a blend is active.
         "step_dodge": AnimationClip(
@@ -44,6 +46,21 @@ def build_demo_library():
                 Keyframe(0.30, (0.7, -0.7), (0.0, 0.0)),
             ],
             loop=False,
+            markers=[Marker(0.15, "dodge_peak", {"side": "left"})],
+        ),
+        "attack": AnimationClip(
+            "attack",
+            [
+                Keyframe(0.0, (0.0, 0.0), (0.0, 0.0)),
+                Keyframe(0.2, (0.5, 0.0), (0.3, 0.0)),
+                Keyframe(0.35, (0.9, 0.0), (0.4, 0.0)),
+                Keyframe(0.6, (0.1, 0.0), (0.0, 0.0)),
+            ],
+            loop=False,
+            markers=[
+                Marker(0.25, "windup", {"stage": "anticipation"}),
+                Marker(0.35, "hit", {"damage": 10}),
+            ],
         ),
     }
     return clips

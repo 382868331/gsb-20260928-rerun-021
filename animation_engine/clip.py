@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .math_utils import clamp, lerp
 from .pose import Pose
@@ -12,10 +12,24 @@ class Keyframe:
     omega: float = 0.0
 
 
+@dataclass(frozen=True)
+class Marker:
+    """Tagged point on the clip timeline.
+
+    Markers are authored on the shared resource; per-character progress
+    (which occurrences have already fired) lives on the player.
+    ``payload`` is forwarded verbatim when the marker fires.
+    """
+
+    t: float
+    name: str
+    payload: object = None
+
+
 class AnimationClip:
     """Immutable action resource shared by any number of character instances."""
 
-    def __init__(self, name: str, keyframes, loop: bool):
+    def __init__(self, name: str, keyframes, loop: bool, markers=()):
         frames = sorted(keyframes, key=lambda f: f.t)
         if len(frames) < 2:
             raise ValueError(f"clip {name!r} needs at least two keyframes")
@@ -26,6 +40,63 @@ class AnimationClip:
         self.duration = frames[-1].t
         self.loop = loop
         self.joint_count = len(frames[0].joints)
+        ordered_markers = sorted(markers, key=lambda m: m.t)
+        names = [m.name for m in ordered_markers]
+        if len(set(names)) != len(names):
+            raise ValueError(f"clip {name!r} marker names must be unique")
+        for marker in ordered_markers:
+            if not 0.0 <= marker.t <= self.duration:
+                raise ValueError(
+                    f"marker {marker.name!r} of clip {name!r} is outside [0, duration]"
+                )
+        self.markers = tuple(ordered_markers)
+
+    def marker(self, name: str) -> Marker:
+        for marker in self.markers:
+            if marker.name == name:
+                return marker
+        raise KeyError(f"clip {self.name!r} has no marker {name!r}")
+
+    def sync_time(self, marker_name: str, current_time: float) -> float:
+        """Target local time that aligns ``marker_name`` with ``current_time``.
+
+        For looping clips the occurrence nearest to ``current_time`` is used,
+        so walk -> run can align the grounded-foot phase without a time jump.
+        Non-looping clips simply start at the tagged time.
+        """
+        marker = self.marker(marker_name)
+        if not self.loop:
+            return marker.t
+        k = round((current_time - marker.t) / self.duration)
+        return k * self.duration + marker.t
+
+    def crossed_markers(self, t0: float, t1: float):
+        """Marker occurrences crossed while moving forward t0 -> t1.
+
+        Half-open interval ``(t0, t1]``: arriving exactly on a marker fires
+        it, but merely standing on one does not. Occurrences are returned in
+        chronological order as ``(absolute_time, cycle_index, marker)``; the
+        cycle index lets the same marker fire once per loop iteration.
+        """
+        if t1 <= t0:
+            return []
+        hits = []
+        if self.loop:
+            duration = self.duration
+            for marker in self.markers:
+                first = int((t0 - marker.t) // duration) + 1
+                last = int((t1 - marker.t) // duration)
+                for k in range(first, last + 1):
+                    absolute = k * duration + marker.t
+                    if t0 < absolute <= t1:
+                        hits.append((absolute, k, marker))
+        else:
+            end = min(t1, self.duration)
+            for marker in self.markers:
+                if t0 < marker.t <= end:
+                    hits.append((marker.t, 0, marker))
+        hits.sort(key=lambda item: item[0])
+        return hits
 
     def _normalise_time(self, t: float) -> float:
         if self.loop:
@@ -55,36 +126,44 @@ class AnimationClip:
     def integrate_root(self, t0: float, dt: float):
         """Exact displacement/turning for piecewise-linear root channels.
 
-        Handles loop wraps by splitting at the wrap point and keyframe times.
-        Returns (dx, dy, d_heading) in the clip local frame.
+        Handles loop wraps by splitting at the wrap point and keyframe times,
+        and supports signed ``dt`` (negative = reverse playback). Non-looping
+        motion is clamped at the clip ends. Returns
+        ``(dx, dy, d_heading)`` in the clip local frame.
         """
-        if dt <= 0.0:
+        if dt == 0.0:
             return 0.0, 0.0, 0.0
-        end = t0 + dt
-        breaks = {t0, end}
+        sign = 1.0 if dt > 0.0 else -1.0
+        low, high = sorted((t0, t0 + dt))
+        if not self.loop:
+            low = max(low, 0.0)
+            high = min(high, self.duration)
+            if high <= low:
+                return 0.0, 0.0, 0.0
+        breaks = {low, high}
         if self.loop:
-            first_wrap = ((t0 // self.duration) + 1) * self.duration
-            boundary = first_wrap
-            while boundary < end:
+            boundary = (int(low // self.duration) + 1) * self.duration
+            while boundary < high:
                 breaks.add(boundary)
                 boundary += self.duration
         for frame in self.keyframes:
-            marker = frame.t
+            frame_t = frame.t
             if self.loop:
-                start_k = int(t0 // self.duration) - 1
-                for k in range(start_k, int(end // self.duration) + 2):
-                    candidate = k * self.duration + marker
-                    if t0 < candidate < end:
+                start_k = int(low // self.duration) - 1
+                for k in range(start_k, int(high // self.duration) + 2):
+                    candidate = k * self.duration + frame_t
+                    if low < candidate < high:
                         breaks.add(candidate)
-            elif t0 < marker < end:
-                breaks.add(marker)
+            elif low < frame_t < high:
+                breaks.add(frame_t)
 
         dx = dy = dh = 0.0
-        for left, right in zip(sorted(breaks), sorted(breaks)[1:]):
+        ordered = sorted(breaks)
+        for left, right in zip(ordered, ordered[1:]):
             p0 = self.sample(left)
             p1 = self.sample(right)
             span = right - left
             dx += 0.5 * (p0.root_velocity[0] + p1.root_velocity[0]) * span
             dy += 0.5 * (p0.root_velocity[1] + p1.root_velocity[1]) * span
             dh += 0.5 * (p0.omega + p1.omega) * span
-        return dx, dy, dh
+        return sign * dx, sign * dy, sign * dh
