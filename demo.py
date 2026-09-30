@@ -103,6 +103,40 @@ def main():
     print(f"saved/restored independent sampling matches: {match}")
     print(f"final root: {animator.root_position}")
 
+    # Marker synchronisation: walk -> run aligns the grounded-foot marker.
+    walker = CharacterAnimator(
+        library,
+        "walk",
+        states=[State("walk"), State("run")],
+    )
+    walker.player.state.local_time = 1.37
+    walker.request_transition(
+        "run", 0.3, sync_markers=(("foot_down", "foot_down"),)
+    )
+    print(
+        "walk phase 0.37 -> run entry phase "
+        f"{walker.player.state.local_time % 1.0:.2f}"
+    )
+
+    # Events fire at markers; one big step matches per-frame stepping.
+    attacker = CharacterAnimator(
+        library,
+        "attack",
+        states=[State("attack"), State("run")],
+    )
+    attacker.update(0.3)
+    print(f"attack events after one 0.3s step: {attacker.drain_events()}")
+
+    # Retargeting mid-blend keeps the queued event but never replays it.
+    attacker2 = CharacterAnimator(
+        library,
+        "attack",
+        states=[State("attack"), State("run")],
+    )
+    attacker2.update(0.25)
+    attacker2.request_transition("run", 0.1)
+    print(f"event survives the mid-blend retarget: {attacker2.drain_events()}")
+
 
 if __name__ == "__main__":
     main()

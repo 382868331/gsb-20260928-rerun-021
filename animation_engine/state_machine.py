@@ -21,6 +21,7 @@ class Transition:
     duration: float
     condition: callable = None
     entry_time: float = 0.0
+    sync_markers: tuple = ()
 
     def allowed(self, context) -> bool:
         return self.condition is None or bool(self.condition(context))
@@ -56,12 +57,15 @@ class CharacterAnimator:
         self.transitions.setdefault(transition.source, []).append(transition)
 
     def request_transition(self, destination: str, duration: float,
-                          entry_time: float = 0.0) -> bool:
+                          entry_time: float = 0.0,
+                          sync_markers=()) -> bool:
         if destination not in self.states:
             return False
         target = self.states[destination]
         self.current_state = destination
-        self.player.transition_to(target.clip_name, duration, entry_time)
+        self.player.transition_to(
+            target.clip_name, duration, entry_time, sync_markers
+        )
         self.player.state.speed = target.speed
         return True
 
@@ -72,6 +76,7 @@ class CharacterAnimator:
                     transition.destination,
                     transition.duration,
                     transition.entry_time,
+                    transition.sync_markers,
                 )
                 return transition.destination
         return None
@@ -90,6 +95,9 @@ class CharacterAnimator:
 
     def current_pose(self):
         return self.player.current_pose()
+
+    def drain_events(self):
+        return self.player.drain_events()
 
     def save_state(self) -> dict:
         return {
