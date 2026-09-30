@@ -20,15 +20,50 @@ def _attack_animator(library):
 
 
 class MarkerSyncTests(unittest.TestCase):
-    def test_loop_sync_picks_nearest_tagged_phase(self):
+    def test_loop_sync_continues_post_marker_phase_offset(self):
         library = build_demo_library()
         animator = CharacterAnimator(
             library, "walk", [State("walk"), State("run")]
         )
         animator.update(0.63)
         animator.request_transition("run", 0.3, sync_marker="foot_down")
-        # Nearest run foot-down occurrence to walk time 0.63 is t=1.0.
-        self.assertAlmostEqual(animator.player.state.local_time, 1.0)
+        # 0.63 s after walk's foot-down must carry into run: no phase snap.
+        self.assertAlmostEqual(animator.player.state.local_time, 0.63)
+
+    def test_loop_sync_offset_is_consistent_across_loop_boundary(self):
+        library = build_demo_library()
+        walk = library["walk"]
+        run = library["run"]
+        # 1.83 is one full walk loop later than 0.83; the offset past the
+        # most recent foot-down is identical on both sides of the boundary.
+        self.assertAlmostEqual(walk.contact_offset("foot_down", 0.83), 0.83)
+        self.assertAlmostEqual(walk.contact_offset("foot_down", 1.83), 0.83)
+        self.assertAlmostEqual(run.sync_time("foot_down", walk, 1.83), 0.83)
+        # Reverse-playback time uses the same modulo semantics.
+        self.assertAlmostEqual(walk.contact_offset("foot_down", -0.17), 0.83)
+
+    def test_transition_history_replays_contact_state(self):
+        library = build_demo_library()
+        animator = CharacterAnimator(
+            library,
+            "walk",
+            [State("walk"), State("run"), State("idle")],
+        )
+        animator.update(0.63)
+        animator.request_transition("run", 0.3, sync_marker="foot_down")
+        animator.update(0.1)
+        animator.request_transition("walk", 0.2, sync_marker="foot_down")
+        history = animator.transition_history()
+        self.assertEqual(len(history), 2)
+        first = history[0]
+        self.assertEqual(first["source"], "walk")
+        self.assertEqual(first["destination"], "run")
+        self.assertAlmostEqual(first["before"]["offset"], 0.63)
+        self.assertAlmostEqual(first["after"]["offset"], 0.63)
+        self.assertAlmostEqual(first["before"]["progress"],
+                               first["after"]["progress"])
+        self.assertEqual(first["before"]["grounded"],
+                         first["after"]["grounded"])
 
     def test_sync_does_not_replay_entry_marker_at_time_zero(self):
         library = build_demo_library()

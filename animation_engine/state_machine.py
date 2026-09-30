@@ -63,9 +63,9 @@ class CharacterAnimator:
         target = self.states[destination]
         self.current_state = destination
         self.player.transition_to(
-            target.clip_name, duration, entry_time, sync_marker
+            target.clip_name, duration, entry_time, sync_marker,
+            new_speed=target.speed,
         )
-        self.player.state.speed = target.speed
         return True
 
     def evaluate_transitions(self, context=None):
@@ -99,6 +99,13 @@ class CharacterAnimator:
 
     def pop_events(self):
         return self.player.pop_events()
+
+    def contact_state(self, marker_name: str = "foot_down"):
+        return self.player.contact_state(marker_name)
+
+    def transition_history(self):
+        """Replayable before/after grounded-foot snapshots per switch."""
+        return self.player.transition_history()
 
     def save_state(self) -> dict:
         return {

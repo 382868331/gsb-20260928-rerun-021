@@ -107,15 +107,34 @@ def main():
     synced = CharacterAnimator(
         library,
         "walk",
-        states=[State("walk"), State("run"), State("attack")],
+        states=[State("walk"), State("run"),
+                State("stride", "walk"), State("attack")],
     )
     synced.update(0.63)
-    synced.request_transition("run", duration=0.2, sync_marker="foot_down")
-    synced.update(0.2)
+    synced.request_transition("run", duration=0.5, sync_marker="foot_down")
+    synced.update(0.12)
+    synced.player.state.speed = 1.5
+    synced.update(0.2)  # crosses a run foot_down while still blending
+    # Third switch before the run blend completes; the phase carries over.
+    synced.request_transition("stride", duration=0.2, sync_marker="foot_down")
+    synced.player.state.speed = 1.0
+    synced.update(0.3)
     synced.request_transition("attack", duration=0.0)
     synced.update(0.6)  # single big step crosses windup then hit
-    print(f"marker-synced run entry local time: {synced.player.state.local_time:.3f}")
-    print(f"attack events: {[e['marker'] for e in synced.pop_events()]}")
+    events = synced.pop_events()
+    print(f"foot events before attack: "
+          f"{[e['clip'] for e in events if e['marker'] == 'foot_down']}")
+    print(f"attack events: {[e['marker'] for e in events
+                             if e['marker'] != 'foot_down']}")
+    for index, entry in enumerate(synced.transition_history()):
+        before, after = entry["before"], entry["after"]
+        if before is None:
+            continue
+        print(
+            f"switch {index}: {entry['source']} -> {entry['destination']} "
+            f"offset {before['offset']:.3f} -> {after['offset']:.3f} "
+            f"grounded {before['grounded']} -> {after['grounded']}"
+        )
 
 
 if __name__ == "__main__":

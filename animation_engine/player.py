@@ -47,6 +47,9 @@ class AnimationPlayer:
             clip_name=clip_name, root_position=tuple(root_position)
         )
         self._pending_events = []
+        # One entry per requested transition: contact snapshots on both
+        # sides, so users can replay the grounded-foot phase at each switch.
+        self._transition_log = []
 
     @property
     def clip(self):
@@ -76,23 +79,86 @@ class AnimationPlayer:
         )
         return Pose(joints, velocity, lerp(st.frozen_omega, target.omega, weight))
 
+    @staticmethod
+    def _contact_snapshot(clip, local_time: float, marker_name: str):
+        """Grounded-foot phase: time elapsed past the marker occurrence.
+
+        ``progress`` is the fraction of one stride (loop) or of the remaining
+        clip span (one-shot); ``grounded`` covers the first half of that span,
+        i.e. the stance phase following the foot-down instant.
+        """
+        marker = clip.marker(marker_name)
+        offset = clip.contact_offset(marker_name, local_time)
+        if clip.loop:
+            period = clip.duration
+            progress = (offset / period) % 1.0 if period else 0.0
+        else:
+            period = max(0.0, clip.duration - marker.t)
+            progress = offset / period if period else 0.0
+        return {
+            "clip": clip.name,
+            "local_time": local_time,
+            "marker": marker_name,
+            "payload": marker.payload,
+            "offset": offset,
+            "progress": progress,
+            "grounded": offset <= 0.5 * period + 1e-12,
+        }
+
+    def contact_state(self, marker_name: str = "foot_down"):
+        """Current grounded-foot phase of the playing clip."""
+        return self._contact_snapshot(
+            self.clip, self.state.local_time, marker_name
+        )
+
+    def transition_history(self):
+        """Before/after contact snapshots for every transition requested."""
+        return list(self._transition_log)
+
     def transition_to(self, clip_name: str, duration: float,
-                      entry_time: float = 0.0, sync_marker: str = None):
-        if clip_name == self.state.clip_name and not self.state.is_blending:
+                      entry_time: float = 0.0, sync_marker: str = None,
+                      new_speed: float = None):
+        st = self.state
+        if clip_name == st.clip_name and not st.is_blending:
             return
+        source_clip = self.clip
+        before_contact = (
+            self._contact_snapshot(source_clip, st.local_time, sync_marker)
+            if sync_marker is not None
+            else None
+        )
+        speed_before = st.speed
         snapshot = self.current_pose()
-        self.state.clip_name = clip_name
         target_clip = self.library[clip_name]
         if sync_marker is not None:
             entry_time = target_clip.sync_time(
-                sync_marker, self.state.local_time
+                sync_marker, source_clip, st.local_time
             )
-        self.state.local_time = entry_time
-        self.state.blend_elapsed = 0.0
-        self.state.blend_duration = max(0.0, duration)
-        self.state.frozen_joints = snapshot.joints
-        self.state.frozen_velocity = snapshot.root_velocity
-        self.state.frozen_omega = snapshot.omega
+        st.clip_name = clip_name
+        st.local_time = entry_time
+        st.blend_elapsed = 0.0
+        st.blend_duration = max(0.0, duration)
+        st.frozen_joints = snapshot.joints
+        st.frozen_velocity = snapshot.root_velocity
+        st.frozen_omega = snapshot.omega
+        if new_speed is not None:
+            st.speed = new_speed
+        after_contact = (
+            self._contact_snapshot(target_clip, entry_time, sync_marker)
+            if sync_marker is not None
+            else None
+        )
+        self._transition_log.append(
+            {
+                "source": source_clip.name,
+                "destination": clip_name,
+                "duration": st.blend_duration,
+                "speed_before": speed_before,
+                "speed_after": new_speed if new_speed is not None else speed_before,
+                "before": before_contact,
+                "after": after_contact,
+            }
+        )
         # Switching clips starts a fresh play-through for the new clip. The
         # old clip's not-yet-reached markers are cancelled rather than
         # replayed through the target cursor; already queued events survive.
@@ -303,6 +369,7 @@ class AnimationPlayer:
             "generation": st.generation,
             "fired_events": [list(key) for key in st.fired_events],
             "pending_events": list(self._pending_events),
+            "transition_log": list(self._transition_log),
         }
 
     def load_state(self, data: dict):
@@ -323,3 +390,4 @@ class AnimationPlayer:
             ),
         )
         self._pending_events = list(data.get("pending_events", []))
+        self._transition_log = list(data.get("transition_log", []))

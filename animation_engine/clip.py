@@ -57,18 +57,39 @@ class AnimationClip:
                 return marker
         raise KeyError(f"clip {self.name!r} has no marker {name!r}")
 
-    def sync_time(self, marker_name: str, current_time: float) -> float:
-        """Target local time that aligns ``marker_name`` with ``current_time``.
+    def contact_offset(self, marker_name: str, current_time: float) -> float:
+        """Time elapsed since the latest marker occurrence at/before now.
 
-        For looping clips the occurrence nearest to ``current_time`` is used,
-        so walk -> run can align the grounded-foot phase without a time jump.
-        Non-looping clips simply start at the tagged time.
+        Looping clips evaluate the offset on the unwrapped timeline, so the
+        same value is returned on either side of a loop boundary and for
+        negative (reverse playback) times. Non-looping clips clamp to the
+        tagged point when it has not been reached yet.
         """
         marker = self.marker(marker_name)
-        if not self.loop:
-            return marker.t
-        k = round((current_time - marker.t) / self.duration)
-        return k * self.duration + marker.t
+        if self.loop:
+            delta = (current_time - marker.t) % self.duration
+            # % always lands in [0, duration); duration itself only appears
+            # for exact later occurrences, which share the marker phase.
+            return delta
+        return max(0.0, current_time - marker.t)
+
+    def sync_time(self, marker_name: str, source_clip,
+                  current_time: float) -> float:
+        """Target time continuing the same post-marker contact phase.
+
+        The source's elapsed time *after* its marker occurrence is carried
+        into the target instead of snapping onto the marker itself, so the
+        foot phase does not jump on walk -> run. Offset past the target end
+        is wrapped for loops and clamped for one-shot clips.
+        """
+        marker = self.marker(marker_name)
+        offset = source_clip.contact_offset(marker_name, current_time)
+        target_time = marker.t + offset
+        if self.loop:
+            target_time %= self.duration
+        else:
+            target_time = clamp(target_time, marker.t, self.duration)
+        return target_time
 
     def crossed_markers(self, t0: float, t1: float):
         """Marker occurrences crossed while moving forward t0 -> t1.
