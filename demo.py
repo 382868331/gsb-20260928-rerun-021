@@ -6,6 +6,7 @@ from animation_engine import (
     Transition,
     build_demo_library,
 )
+from animation_engine.clip import AnimationClip, Keyframe, Marker
 
 
 def pose_delta(a, b):
@@ -137,5 +138,105 @@ def main():
         )
 
 
+def gait_phase_sync_demo():
+    """Different cycle lengths: the stride phase, not the offset, carries."""
+    long_clip = AnimationClip(
+        "long_stride",
+        [Keyframe(0.0, (0.0,), (1.0, 0.0)), Keyframe(1.2, (1.0,), (1.0, 0.0))],
+        loop=True,
+        markers=[Marker(0.0, "foot_down")],
+    )
+    short_clip = AnimationClip(
+        "short_stride",
+        [Keyframe(0.0, (0.0,), (1.0, 0.0)), Keyframe(0.6, (1.0,), (1.0, 0.0))],
+        loop=True,
+        markers=[Marker(0.0, "foot_down")],
+    )
+    clips = {"long_stride": long_clip, "short_stride": short_clip}
+    animator = CharacterAnimator(
+        clips, "long_stride", [State("long_stride"), State("short_stride")]
+    )
+    animator.update(0.72)
+    animator.request_transition("short_stride", 0.2, sync_marker="foot_down")
+    print("gait phase sync (1.2s cycle @0.72 -> 0.6s cycle): "
+          f"lands at {animator.player.state.local_time:.3f}s (expect 0.360)")
+
+
+def speed_schedule_demo():
+    """Uniform vs variable playback: foot-down times and travel distance."""
+    library = build_demo_library()
+
+    uniform = CharacterAnimator(library, "walk", [State("walk")])
+    # Frame-accurate event clock: poll after each small step.
+    clock = {"t": 0.0}
+    foot_times, foot_distances = [], []
+    last_root = uniform.root_position
+    for _ in range(300):
+        uniform.update(0.01)
+        clock["t"] += 0.01
+        for event in uniform.pop_events():
+            root = uniform.root_position
+            foot_times.append(clock["t"])
+            foot_distances.append(
+                ((root[0] - last_root[0]) ** 2
+                 + (root[1] - last_root[1]) ** 2) ** 0.5
+            )
+            last_root = root
+    print("uniform walk (1.0s cycle):")
+    for i, (t, d) in enumerate(zip(foot_times, foot_distances)):
+        print(f"  foot_down {i + 1}: t={t:.2f}s  distance={d:.3f}m")
+
+    warped = CharacterAnimator(library, "walk", [State("walk")])
+    # Slow the stance half, hurry the swing half, 0.8s target cycle.
+    warped.set_speed_schedule([(0.5, 0.5), (1.0, 2.0)], target_duration=0.8)
+    clock["t"] = 0.0
+    foot_times, foot_distances = [], []
+    last_root = warped.root_position
+    for _ in range(300):
+        warped.update(0.01)
+        clock["t"] += 0.01
+        for event in warped.pop_events():
+            root = warped.root_position
+            foot_times.append(clock["t"])
+            foot_distances.append(
+                ((root[0] - last_root[0]) ** 2
+                 + (root[1] - last_root[1]) ** 2) ** 0.5
+            )
+            last_root = root
+    print("variable walk (stance 0.5x, swing 2.0x, 0.8s target cycle):")
+    for i, (t, d) in enumerate(zip(foot_times, foot_distances)):
+        print(f"  foot_down {i + 1}: t={t:.2f}s  distance={d:.3f}m")
+
+    # Changing the arrangement mid-blend only re-times the future.
+    live = CharacterAnimator(
+        library, "walk", [State("walk"), State("run")]
+    )
+    live.update(0.63)
+    live.request_transition("run", 0.5, sync_marker="foot_down")
+    live.update(0.37)
+    before = [e["cycle"] for e in live.pop_events()]
+    live.set_speed_schedule([(0.5, 0.25), (1.0, 4.0)])
+    live.update(2.125)
+    after = [e["cycle"] for e in live.pop_events()]
+    print("mid-blend schedule change: fired cycles "
+          f"{before} kept, new arrivals {after} follow the new plan")
+
+    # Save/restore mid-blend with a schedule keeps the phase progress.
+    checkpoint = live.save_state()
+    restored = CharacterAnimator(
+        library, "walk", [State("walk"), State("run")]
+    )
+    restored.load_state(checkpoint)
+    for _ in range(10):
+        live.update(0.05)
+        restored.update(0.05)
+    drift = abs(
+        live.player.state.local_time - restored.player.state.local_time
+    )
+    print(f"save/restore with schedule: phase drift {drift:.2e}")
+
+
 if __name__ == "__main__":
     main()
+    gait_phase_sync_demo()
+    speed_schedule_demo()

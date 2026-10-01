@@ -103,6 +103,10 @@ class CharacterAnimator:
     def contact_state(self, marker_name: str = "foot_down"):
         return self.player.contact_state(marker_name)
 
+    def set_speed_schedule(self, segments, target_duration=None):
+        """Install a variable-speed arrangement on the current clip."""
+        self.player.set_speed_schedule(segments, target_duration)
+
     def transition_history(self):
         """Replayable before/after grounded-foot snapshots per switch."""
         return self.player.transition_history()

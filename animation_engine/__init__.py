@@ -2,6 +2,7 @@ from .clip import AnimationClip, Keyframe, Marker
 from .library import build_demo_library
 from .pose import Pose
 from .state_machine import CharacterAnimator, State, Transition
+from .timing import SpeedSchedule, SpeedSegment
 
 __all__ = [
     "AnimationClip",
@@ -12,4 +13,6 @@ __all__ = [
     "CharacterAnimator",
     "State",
     "Transition",
+    "SpeedSchedule",
+    "SpeedSegment",
 ]

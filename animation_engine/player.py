@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from .math_utils import lerp, smoothstep
 from .math_utils import clamp
 from .pose import Pose
+from .timing import SpeedSchedule
 
 _GAUSS_NODES = (
     0.046910077030668, 0.230765344947157, 0.5, 0.769234655052843,
@@ -32,6 +33,8 @@ class PlaybackState:
     generation: int = 0
     # Occurrence keys that have already fired during this play-through.
     fired_events: tuple = ()
+    # Optional per-player variable-speed arrangement over the clip cycle.
+    speed_schedule: object = None
 
     @property
     def is_blending(self) -> bool:
@@ -89,12 +92,8 @@ class AnimationPlayer:
         """
         marker = clip.marker(marker_name)
         offset = clip.contact_offset(marker_name, local_time)
-        if clip.loop:
-            period = clip.duration
-            progress = (offset / period) % 1.0 if period else 0.0
-        else:
-            period = max(0.0, clip.duration - marker.t)
-            progress = offset / period if period else 0.0
+        period = clip.contact_period(marker_name)
+        progress = (offset / period) % 1.0 if period else 0.0
         return {
             "clip": clip.name,
             "local_time": local_time,
@@ -164,6 +163,9 @@ class AnimationPlayer:
         # replayed through the target cursor; already queued events survive.
         self.state.generation += 1
         self.state.fired_events = ()
+        # Speed schedules are authored against a specific clip's timeline;
+        # they do not transfer across clips.
+        self.state.speed_schedule = None
 
     def seek(self, local_time: float):
         """Jump the cursor without blending or emitting events.
@@ -206,6 +208,77 @@ class AnimationPlayer:
         events = self._pending_events
         self._pending_events = []
         return events
+
+    def set_speed_schedule(self, segments, target_duration=None):
+        """Install (or clear, with ``None``) a variable-speed arrangement.
+
+        Takes effect from the next ``update`` onwards: marker arrival times
+        and foot events after the change follow the new schedule, while
+        already fired events are never rewritten. Safe to call mid-blend.
+        """
+        if segments is None:
+            self.state.speed_schedule = None
+            return
+        schedule = SpeedSchedule(segments, target_duration)
+        schedule.validate_for(self.clip)
+        self.state.speed_schedule = schedule
+
+    def _schedule_substeps(self, dt: float):
+        """Split ``dt`` so no piece crosses a speed-segment boundary.
+
+        Yields ``(sub_dt, clip_rate)`` pairs lazily; clip time advances by
+        ``sub_dt * clip_rate`` inside each piece, where the rate is
+        constant. Must be consumed piece by piece, applying each piece
+        before requesting the next, because the phase is read from the
+        live cursor. Works for negative ``dt`` (reverse playback) and
+        wraps around loop cycles, since the schedule is defined on the
+        cycle phase.
+        """
+        st = self.state
+        clip = self.clip
+        schedule = st.speed_schedule
+        duration = clip.duration
+        scale = schedule.time_scale()
+        sign = 1.0 if dt > 0.0 else -1.0
+        remaining = abs(dt)
+        eps = 1e-9
+        for _ in range(4096):
+            if remaining <= 1e-12:
+                break
+            if clip.loop:
+                phase = st.local_time % duration
+            else:
+                phase = clamp(st.local_time, 0.0, duration)
+                at_end = (
+                    (sign > 0 and st.local_time >= duration)
+                    or (sign < 0 and st.local_time <= 0.0)
+                )
+                if at_end:
+                    # Clamped at the clip end: one final piece, the core
+                    # update performs the clamping itself.
+                    rate = schedule.rate_at(phase)
+                    yield sign * remaining, st.speed * rate * scale
+                    return
+            if sign > 0:
+                probe = phase
+            elif clip.loop:
+                probe = (phase - eps) % duration
+            else:
+                probe = max(0.0, phase - eps)
+            index = schedule.segment_index(probe)
+            segment = schedule.segments[index]
+            clip_rate = st.speed * segment.rate * scale
+            if sign > 0:
+                distance = segment.end - phase
+            else:
+                distance = phase - schedule.segment_start(index)
+            if distance <= eps:
+                # Floating-point residue on a boundary: treat the whole
+                # segment as remaining so the cursor always makes progress.
+                distance = segment.end - schedule.segment_start(index)
+            sub = min(remaining, distance / clip_rate)
+            remaining -= sub
+            yield sign * sub, clip_rate
 
     def _collect_events(self, clip, t0: float, t1: float):
         for _, cycle, marker in clip.crossed_markers(t0, t1):
@@ -282,7 +355,22 @@ class AnimationPlayer:
             return self.current_pose()
 
         st = self.state
-        effective_dt = dt * st.speed
+        if st.speed_schedule is None:
+            return self._update_core(dt, st.speed)
+        pose = self.current_pose()
+        for sub_dt, clip_rate in self._schedule_substeps(dt):
+            pose = self._update_core(sub_dt, clip_rate)
+        return pose
+
+    def _update_core(self, dt: float, clip_rate: float):
+        """Advance by ``dt`` wall seconds at a constant clip rate.
+
+        ``clip_rate`` is the playback speed times any schedule rate in
+        effect for this piece; blend progress is measured in the same
+        clip-time units, matching the uniform-speed behaviour.
+        """
+        st = self.state
+        effective_dt = dt * clip_rate
         clip = self.clip
         dx = dy = dh = 0.0
 
@@ -368,6 +456,11 @@ class AnimationPlayer:
             "frozen_omega": st.frozen_omega,
             "generation": st.generation,
             "fired_events": [list(key) for key in st.fired_events],
+            "speed_schedule": (
+                st.speed_schedule.to_dict()
+                if st.speed_schedule is not None
+                else None
+            ),
             "pending_events": list(self._pending_events),
             "transition_log": list(self._transition_log),
         }
@@ -387,6 +480,9 @@ class AnimationPlayer:
             generation=data.get("generation", 0),
             fired_events=tuple(
                 tuple(key) for key in data.get("fired_events", ())
+            ),
+            speed_schedule=SpeedSchedule.from_dict(
+                data.get("speed_schedule")
             ),
         )
         self._pending_events = list(data.get("pending_events", []))

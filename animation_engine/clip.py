@@ -73,17 +73,39 @@ class AnimationClip:
             return delta
         return max(0.0, current_time - marker.t)
 
+    def contact_period(self, marker_name: str) -> float:
+        """Length of one full contact cycle for the given marker.
+
+        Looping clips cycle over the whole duration; one-shot clips cycle
+        over the span remaining after the tagged point.
+        """
+        marker = self.marker(marker_name)
+        if self.loop:
+            return self.duration
+        return max(0.0, self.duration - marker.t)
+
     def sync_time(self, marker_name: str, source_clip,
                   current_time: float) -> float:
         """Target time continuing the same post-marker contact phase.
 
-        The source's elapsed time *after* its marker occurrence is carried
-        into the target instead of snapping onto the marker itself, so the
-        foot phase does not jump on walk -> run. Offset past the target end
-        is wrapped for loops and clamped for one-shot clips.
+        The source's post-marker offset is scaled by the ratio of the two
+        clips' contact periods, so switching between cycles of different
+        lengths preserves the *phase* of the stride (0.72 s into a 1.2 s
+        cycle maps to 0.36 s into a 0.6 s cycle) instead of carrying the
+        absolute offset and landing on the wrong foot. Works for non-zero
+        marker times, across loop boundaries and for negative (reverse
+        playback) source times, since the offset is computed modulo the
+        source cycle. The result is wrapped for loops and clamped for
+        one-shot clips.
         """
         marker = self.marker(marker_name)
         offset = source_clip.contact_offset(marker_name, current_time)
+        source_period = source_clip.contact_period(marker_name)
+        target_period = self.contact_period(marker_name)
+        if source_period > 0.0:
+            offset *= target_period / source_period
+        else:
+            offset = 0.0
         target_time = marker.t + offset
         if self.loop:
             target_time %= self.duration
