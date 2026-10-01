@@ -32,6 +32,13 @@ class PlaybackState:
     generation: int = 0
     # Occurrence keys that have already fired during this play-through.
     fired_events: tuple = ()
+    # Piecewise-constant playback-rate profile over the clip phase:
+    # ((phase_start, speed), ...) sorted by phase_start, covering [0, 1).
+    # Empty means uniform playback at ``speed``.
+    speed_segments: tuple = ()
+    # Target wall-clock duration of one full gait cycle. When set, the
+    # segment speeds are normalised so one loop takes exactly this long.
+    target_cycle_duration: float = None
 
     @property
     def is_blending(self) -> bool:
@@ -89,12 +96,8 @@ class AnimationPlayer:
         """
         marker = clip.marker(marker_name)
         offset = clip.contact_offset(marker_name, local_time)
-        if clip.loop:
-            period = clip.duration
-            progress = (offset / period) % 1.0 if period else 0.0
-        else:
-            period = max(0.0, clip.duration - marker.t)
-            progress = offset / period if period else 0.0
+        period = clip.contact_period(marker_name)
+        progress = (offset / period) % 1.0 if period else 0.0
         return {
             "clip": clip.name,
             "local_time": local_time,
@@ -114,6 +117,143 @@ class AnimationPlayer:
     def transition_history(self):
         """Before/after contact snapshots for every transition requested."""
         return list(self._transition_log)
+
+    def set_speed_schedule(self, segments, target_cycle_duration=None):
+        """Install a piecewise-constant speed profile over the clip phase.
+
+        ``segments`` is an iterable of ``(phase_start, speed)`` pairs with
+        ``phase_start`` in [0, 1) and ``speed`` > 0; each segment runs until
+        the next start (the last wraps to 1.0). Empty segments restore
+        uniform playback. ``target_cycle_duration`` sets the wall-clock
+        length of one full gait cycle: segment speeds are then treated as
+        relative and normalised so a full loop takes exactly that long.
+        Changing the schedule mid-blend only affects future updates;
+        already fired events are never rewritten.
+        """
+        normalised = []
+        for segment in segments or ():
+            start, speed = float(segment[0]), float(segment[1])
+            if not 0.0 <= start < 1.0:
+                raise ValueError(
+                    f"segment start {start} outside [0, 1)"
+                )
+            if speed <= 0.0:
+                raise ValueError(f"segment speed {speed} must be positive")
+            normalised.append((start, speed))
+        normalised.sort()
+        starts = [start for start, _ in normalised]
+        if len(set(starts)) != len(starts):
+            raise ValueError("duplicate segment start phases")
+        if target_cycle_duration is not None and target_cycle_duration <= 0.0:
+            raise ValueError("target cycle duration must be positive")
+        self.state.speed_segments = tuple(normalised)
+        self.state.target_cycle_duration = target_cycle_duration
+
+    def _schedule_scale(self, clip) -> float:
+        """Global rate multiplier turning segment speeds into clip-time rate."""
+        target = self.state.target_cycle_duration
+        if not target:
+            return 1.0
+        segments = self.state.speed_segments
+        harmonic = 0.0
+        for index, (start, speed) in enumerate(segments):
+            end = segments[index + 1][0] if index + 1 < len(segments) else 1.0
+            harmonic += (end - start) / speed
+        return clip.duration * harmonic / target
+
+    def _schedule_rate(self, clip, local_time: float) -> float:
+        """Clip-time advance per wall second at the given local time."""
+        duration = clip.duration
+        if clip.loop:
+            phase = (local_time % duration) / duration
+        else:
+            phase = clamp(local_time, 0.0, duration) / duration
+        speed = self.state.speed_segments[-1][1]
+        for start, segment_speed in self.state.speed_segments:
+            if start <= phase + 1e-12:
+                speed = segment_speed
+        return speed * self._schedule_scale(clip)
+
+    def _segment_boundary(self, clip, t: float, sign: float) -> float:
+        """Next speed-segment boundary in unwrapped clip time from ``t``."""
+        duration = clip.duration
+        starts = [start for start, _ in self.state.speed_segments]
+        if clip.loop:
+            base = math.floor(t / duration) * duration
+            phase = (t - base) / duration
+        else:
+            base = 0.0
+            phase = clamp(t, 0.0, duration) / duration
+        if sign > 0:
+            if phase > 1.0 - 1e-9 and clip.loop:
+                phase, base = 0.0, base + duration
+            for start in starts:
+                if start > phase + 1e-9:
+                    return base + start * duration
+            return base + duration
+        if phase < 1e-9 and clip.loop:
+            phase, base = 1.0, base - duration
+        for start in reversed(starts):
+            if start < phase - 1e-9:
+                return base + start * duration
+        return base
+
+    def _schedule_path(self, clip, t0: float, effective_dt: float):
+        """Split a signed wall step into constant-rate pieces.
+
+        Returns ``(wall0, wall1, clip_t0, clip_t1)`` tuples; wall offsets are
+        relative to the start of this step and carry the sign of
+        ``effective_dt``. Without a schedule a single 1:1 piece is returned.
+        """
+        if not self.state.speed_segments or effective_dt == 0.0:
+            return [(0.0, effective_dt, t0, t0 + effective_dt)]
+        duration = clip.duration
+        sign = 1.0 if effective_dt > 0.0 else -1.0
+        remaining = abs(effective_dt)
+        t = t0
+        wall = 0.0
+        pieces = []
+        while remaining > 1e-12:
+            if not clip.loop and (
+                (sign > 0 and t >= duration) or (sign < 0 and t <= 0.0)
+            ):
+                # One-shot clip clamped at its end: the rest of the step is
+                # inert (root integration and markers clamp there too).
+                pieces.append((wall, wall + sign * remaining, t,
+                               t + sign * remaining))
+                break
+            boundary = self._segment_boundary(clip, t, sign)
+            width = abs(boundary - t)
+            if width < 1e-12:
+                t = boundary
+                continue
+            rate = self._schedule_rate(clip, 0.5 * (t + boundary))
+            wall_to_boundary = width / rate
+            step = min(remaining, wall_to_boundary)
+            t_next = t + sign * step * rate
+            pieces.append((wall, wall + sign * step, t, t_next))
+            wall += sign * step
+            remaining -= step
+            t = t_next
+        return pieces
+
+    def _keyframe_breaks(self, clip, c0: float, c1: float):
+        """Keyframe times strictly inside the clip-time interval (c0, c1)."""
+        breaks = []
+        if c1 <= c0:
+            return breaks
+        for frame in clip.keyframes:
+            frame_t = frame.t
+            if clip.loop:
+                k = math.floor((c0 - frame_t) / clip.duration) + 1
+                candidate = k * clip.duration + frame_t
+                while candidate < c1 - 1e-12:
+                    if candidate > c0 + 1e-12:
+                        breaks.append(candidate)
+                    candidate += clip.duration
+            elif c0 + 1e-12 < frame_t < c1 - 1e-12:
+                breaks.append(frame_t)
+        return sorted(breaks)
 
     def transition_to(self, clip_name: str, duration: float,
                       entry_time: float = 0.0, sync_marker: str = None,
@@ -214,12 +354,18 @@ class AnimationPlayer:
     def _advance_without_blend(self, clip, effective_dt: float):
         st = self.state
         start = st.local_time
-        dx, dy, dh = clip.integrate_root(start, effective_dt)
-        end = start + effective_dt
-        if effective_dt > 0.0:
-            self._collect_events(clip, start, end)
         # Reverse playback never fires events; moving backwards only rewinds
         # pose and root channels.
+        dx = dy = dh = 0.0
+        end = start
+        for _, _, c0, c1 in self._schedule_path(clip, start, effective_dt):
+            move = clip.integrate_root(c0, c1 - c0)
+            dx += move[0]
+            dy += move[1]
+            dh += move[2]
+            if c1 > c0:
+                self._collect_events(clip, c0, c1)
+            end = c1
         if not clip.loop:
             end = clamp(end, 0.0, clip.duration)
         st.local_time = end
@@ -277,6 +423,64 @@ class AnimationPlayer:
             st.frozen_omega * frozen_scale + sums[2],
         )
 
+    def _integrate_blend_mapped(self, clip, w0: float, w1: float,
+                                c0: float, c1: float):
+        """Blend-weighted root move for one constant-rate schedule piece.
+
+        ``w0``/``w1`` are wall-clock offsets from the start of the update
+        (driving the blend weight); ``c0``/``c1`` are the matching clip
+        times under the current speed schedule.
+        """
+        st = self.state
+        wall_span = w1 - w0
+        clip_span = c1 - c0
+        sums = [0.0, 0.0, 0.0]
+        for node, weight in zip(_GAUSS_NODES, _GAUSS_WEIGHTS):
+            offset = w0 + node * wall_span
+            pose = clip.sample(c0 + node * clip_span)
+            alpha = (st.blend_elapsed + offset) / st.blend_duration
+            blend_weight = smoothstep(alpha)
+            values = (
+                pose.root_velocity[0],
+                pose.root_velocity[1],
+                pose.omega,
+            )
+            for i, value in enumerate(values):
+                sums[i] += weight * blend_weight * value * wall_span
+
+        frozen_scale = self._frozen_weight_integral(w0, w1)
+        return (
+            st.frozen_velocity[0] * frozen_scale + sums[0],
+            st.frozen_velocity[1] * frozen_scale + sums[1],
+            st.frozen_omega * frozen_scale + sums[2],
+        )
+
+    def _advance_scheduled_blend(self, clip, blended_dt: float):
+        """Blend advance under a speed schedule; returns the root move."""
+        st = self.state
+        dx = dy = dh = 0.0
+        pieces = self._schedule_path(clip, st.local_time, blended_dt)
+        for w0, w1, c0, c1 in pieces:
+            cuts = [c0] + self._keyframe_breaks(clip, c0, c1) + [c1]
+            for left, right in zip(cuts, cuts[1:]):
+                if c1 != c0:
+                    frac0 = (left - c0) / (c1 - c0)
+                    frac1 = (right - c0) / (c1 - c0)
+                else:
+                    frac0, frac1 = 0.0, 1.0
+                wa = w0 + frac0 * (w1 - w0)
+                wb = w0 + frac1 * (w1 - w0)
+                move = self._integrate_blend_mapped(clip, wa, wb, left, right)
+                dx += move[0]
+                dy += move[1]
+                dh += move[2]
+            if c1 > c0:
+                self._collect_events(clip, c0, c1)
+        if pieces:
+            st.local_time = pieces[-1][3]
+        st.blend_elapsed += blended_dt
+        return dx, dy, dh
+
     def update(self, dt: float):
         if dt == 0.0:
             return self.current_pose()
@@ -298,30 +502,30 @@ class AnimationPlayer:
         if st.is_blending and effective_dt >= 0.0:
             blended_dt = min(effective_dt, st.blend_duration - st.blend_elapsed)
             tail_dt = effective_dt - blended_dt
-            breaks = self._velocity_breaks(clip, st.local_time, blended_dt)
-            for start, end in zip(breaks, breaks[1:]):
-                move = self._integrate_blend(
-                    clip, st.local_time, start, end - start
-                )
+            if st.speed_segments:
+                move = self._advance_scheduled_blend(clip, blended_dt)
                 dx += move[0]
                 dy += move[1]
                 dh += move[2]
+            else:
+                breaks = self._velocity_breaks(clip, st.local_time, blended_dt)
+                for start, end in zip(breaks, breaks[1:]):
+                    move = self._integrate_blend(
+                        clip, st.local_time, start, end - start
+                    )
+                    dx += move[0]
+                    dy += move[1]
+                    dh += move[2]
 
-            blend_end_time = st.local_time + blended_dt
-            self._collect_events(clip, st.local_time, blend_end_time)
-            st.local_time = blend_end_time
-            st.blend_elapsed += blended_dt
+                blend_end_time = st.local_time + blended_dt
+                self._collect_events(clip, st.local_time, blend_end_time)
+                st.local_time = blend_end_time
+                st.blend_elapsed += blended_dt
             if tail_dt > 0.0:
-                tail_start = st.local_time
-                move = clip.integrate_root(tail_start, tail_dt)
+                move = self._advance_without_blend(clip, tail_dt)
                 dx += move[0]
                 dy += move[1]
                 dh += move[2]
-                tail_end = tail_start + tail_dt
-                self._collect_events(clip, tail_start, tail_end)
-                if not clip.loop:
-                    tail_end = clamp(tail_end, 0.0, clip.duration)
-                st.local_time = tail_end
             if st.blend_elapsed >= st.blend_duration:
                 st.blend_elapsed = 0.0
                 st.blend_duration = 0.0
@@ -368,6 +572,8 @@ class AnimationPlayer:
             "frozen_omega": st.frozen_omega,
             "generation": st.generation,
             "fired_events": [list(key) for key in st.fired_events],
+            "speed_segments": [list(seg) for seg in st.speed_segments],
+            "target_cycle_duration": st.target_cycle_duration,
             "pending_events": list(self._pending_events),
             "transition_log": list(self._transition_log),
         }
@@ -388,6 +594,10 @@ class AnimationPlayer:
             fired_events=tuple(
                 tuple(key) for key in data.get("fired_events", ())
             ),
+            speed_segments=tuple(
+                tuple(seg) for seg in data.get("speed_segments", ())
+            ),
+            target_cycle_duration=data.get("target_cycle_duration"),
         )
         self._pending_events = list(data.get("pending_events", []))
         self._transition_log = list(data.get("transition_log", []))

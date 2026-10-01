@@ -1,7 +1,10 @@
 """Run the built-in short action scenario and print continuity diagnostics."""
 
 from animation_engine import (
+    AnimationClip,
     CharacterAnimator,
+    Keyframe,
+    Marker,
     State,
     Transition,
     build_demo_library,
@@ -137,5 +140,73 @@ def main():
         )
 
 
+def _gait_clip(name, duration, speed):
+    return AnimationClip(
+        name,
+        [
+            Keyframe(0.0, (0.0,), (speed, 0.0)),
+            Keyframe(duration, (0.0,), (speed, 0.0)),
+        ],
+        loop=True,
+        markers=[Marker(0.0, "foot_down", {"foot": "left"})],
+    )
+
+
+def gait_timing_demo():
+    """Different-period sync plus uniform vs per-phase speed schedules."""
+    library = {"slow": _gait_clip("slow", 1.2, 1.0),
+               "fast": _gait_clip("fast", 0.6, 2.0)}
+    states = [State("slow"), State("fast")]
+
+    # 1.2 s cycle at 0.72 s switches into a 0.6 s cycle: the contact phase
+    # (60%) lands at 0.36 s, not at the raw-offset wrap of 0.12 s.
+    synced = CharacterAnimator(library, "slow", states)
+    synced.update(0.72)
+    synced.request_transition("fast", 0.2, sync_marker="foot_down")
+    print(f"1.2s@0.72 -> 0.6s cycle lands at "
+          f"{synced.player.state.local_time:.2f}s (phase-matched 0.36)")
+
+    # Uniform playback vs a stance/swing speed schedule, both targeting a
+    # 1.0 s cycle: print every footfall time and the distance covered.
+    gait = {"gait": _gait_clip("gait", 1.0, 1.0)}
+    for label, schedule in (
+        ("uniform", None),
+        ("variable", [(0.0, 0.5), (0.5, 2.0)]),
+    ):
+        runner = CharacterAnimator(gait, "gait", [State("gait")])
+        if schedule is not None:
+            runner.set_speed_schedule(schedule, target_cycle_duration=1.0)
+        wall = 0.0
+        footfalls = []
+        for _ in range(210):
+            runner.update(0.01)
+            wall += 0.01
+            for event in runner.pop_events():
+                footfalls.append((wall, runner.root_position[0]))
+        stamps = ", ".join(
+            f"{t:.2f}s@{x:.3f}m" for t, x in footfalls[:3]
+        )
+        print(f"{label:8s} footfalls: {stamps} "
+              f"(first-cycle distance {footfalls[0][1]:.3f}m)")
+
+    # Changing the schedule mid-blend retimes future footfalls only; a
+    # save/restore in the middle continues the same phase progress.
+    live = CharacterAnimator(gait, "gait", [State("gait")])
+    live.set_speed_schedule([(0.0, 0.5), (0.5, 2.0)],
+                            target_cycle_duration=1.0)
+    live.update(0.4)
+    checkpoint = live.save_state()
+    live.set_speed_schedule([(0.0, 2.0)], target_cycle_duration=0.5)
+    restored = CharacterAnimator(gait, "gait", [State("gait")])
+    restored.load_state(checkpoint)
+    restored.set_speed_schedule([(0.0, 2.0)], target_cycle_duration=0.5)
+    for _ in range(50):
+        live.update(0.01)
+        restored.update(0.01)
+    print(f"mid-blend reschedule: live x={live.root_position[0]:.6f} "
+          f"restored x={restored.root_position[0]:.6f}")
+
+
 if __name__ == "__main__":
     main()
+    gait_timing_demo()

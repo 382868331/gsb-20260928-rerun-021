@@ -73,18 +73,42 @@ class AnimationClip:
             return delta
         return max(0.0, current_time - marker.t)
 
+    def contact_period(self, marker_name: str) -> float:
+        """Length of one contact cycle for the marker.
+
+        Looping clips cycle the marker once per loop; one-shot clips treat
+        the span after the tagged point as the contact cycle.
+        """
+        marker = self.marker(marker_name)
+        if self.loop:
+            return self.duration
+        return max(0.0, self.duration - marker.t)
+
+    def contact_phase(self, marker_name: str, current_time: float) -> float:
+        """Normalised contact phase in [0, 1): offset / contact period.
+
+        The phase is what transfers between clips of different cycle
+        lengths; raw offsets only coincide when the periods match.
+        """
+        period = self.contact_period(marker_name)
+        if period <= 0.0:
+            return 0.0
+        return self.contact_offset(marker_name, current_time) / period
+
     def sync_time(self, marker_name: str, source_clip,
                   current_time: float) -> float:
         """Target time continuing the same post-marker contact phase.
 
-        The source's elapsed time *after* its marker occurrence is carried
-        into the target instead of snapping onto the marker itself, so the
-        foot phase does not jump on walk -> run. Offset past the target end
-        is wrapped for loops and clamped for one-shot clips.
+        The source's *normalised* phase (elapsed time after its marker
+        occurrence, divided by its contact period) is carried into the
+        target instead of copying the raw offset, so switching between
+        loops of different lengths (1.2 s -> 0.6 s) keeps the foot phase
+        instead of jumping. The phase is scaled by the target's own
+        contact period, wrapped for loops and clamped for one-shot clips.
         """
         marker = self.marker(marker_name)
-        offset = source_clip.contact_offset(marker_name, current_time)
-        target_time = marker.t + offset
+        phase = source_clip.contact_phase(marker_name, current_time)
+        target_time = marker.t + phase * self.contact_period(marker_name)
         if self.loop:
             target_time %= self.duration
         else:
