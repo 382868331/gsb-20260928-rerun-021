@@ -2,11 +2,16 @@
 
 from animation_engine import (
     CharacterAnimator,
+    FootSpec,
+    GaitTracker,
+    GroundSegment,
     State,
+    Terrain,
     Transition,
     build_demo_library,
 )
 from animation_engine.clip import AnimationClip, Keyframe, Marker
+from animation_engine.player import AnimationPlayer
 
 
 def pose_delta(a, b):
@@ -240,3 +245,41 @@ if __name__ == "__main__":
     main()
     gait_phase_sync_demo()
     speed_schedule_demo()
+
+
+def footstep_demo():
+    library = build_demo_library()
+    player = AnimationPlayer(library, "walk")
+    terrain = Terrain([
+        GroundSegment(-1.0, 2.0, 0.0, "floor"),
+        # Gap between 2.0 and 2.6: no ground to plant on.
+        GroundSegment(2.6, 10.0, 0.4, "step"),
+    ])
+    tracker = GaitTracker(
+        player,
+        terrain,
+        [
+            FootSpec("left", (0.0, 0.5), offset=(0.3, 0.1)),
+            FootSpec("right", (0.5, 1.0), offset=(0.3, -0.1)),
+        ],
+    )
+    for _ in range(60):
+        tracker.update(0.05)
+    print("footsteps on uneven ground (gap 2.0-2.6, step at +0.4m):")
+    for record in tracker.contact_records():
+        if record["satisfied"]:
+            x, h = record["position"]
+            print(f"  {record['foot']:5s} planted x={x:.2f} h={h:.1f} "
+                  f"slide<={record['max_slide']:.3f}m")
+        else:
+            print(f"  {record['foot']:5s} UNSATISFIED "
+                  f"({record['reason']}) at t={record['plant_time']:.2f}s")
+    plans = tracker.evaluate_plans("left")
+    for plan in plans:
+        print(f"  plan {plan['strategy']}: satisfied={plan['satisfied']} "
+              f"position={plan['position']} "
+              f"adjustment={plan['stride_adjustment']}")
+
+
+if __name__ == "__main__":
+    footstep_demo()
