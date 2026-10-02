@@ -1,8 +1,13 @@
 """Run the built-in short action scenario and print continuity diagnostics."""
 
 from animation_engine import (
+    AnimationPlayer,
     CharacterAnimator,
+    FootSpec,
+    FootstepTracker,
+    GroundSegment,
     State,
+    Terrain,
     Transition,
     build_demo_library,
 )
@@ -236,7 +241,75 @@ def speed_schedule_demo():
     print(f"save/restore with schedule: phase drift {drift:.2e}")
 
 
+def footstep_constraint_demo():
+    """Per-foot contacts on uneven ground with a mid-run speed change."""
+    library = build_demo_library()
+    player = AnimationPlayer(library, "walk")
+    terrain = Terrain([
+        GroundSegment("floor", -10.0, 3.0, 0.0),
+        # hole between 3.0 and 3.4, then a pad, then a 40 cm curb
+        GroundSegment("pad", 3.4, 5.0, 0.0),
+        GroundSegment("curb", 5.0, 100.0, 0.4),
+    ])
+    feet = [
+        FootSpec("left", (0.0, 0.5), 0.3, max_step_height=0.25),
+        FootSpec("right", (0.5, 1.0), 0.3, max_step_height=0.25),
+    ]
+    tracker = FootstepTracker(player, feet, terrain)
+
+    for _ in range(24):  # 1.2 s on flat ground
+        tracker.update(0.05)
+    print("footsteps: report at t=1.2 "
+          f"(root x={player.root_position[0]:.2f}):")
+    for name, foot in tracker.contact_report().items():
+        print(f"  {name}: {foot['status']} pos={foot['position']} "
+              f"slip={foot['slip']:.3f} reason={foot['reason']}")
+
+    # Slow the stance half down mid-run: future plants are re-timed,
+    # confirmed contacts stay as recorded.
+    player.set_speed_schedule([(0.5, 0.5), (1.0, 2.0)])
+    for _ in range(40):
+        tracker.update(0.05)
+    print("footsteps: contact history after speed change + curb:")
+    for record in tracker.contact_history():
+        position = record["position"] or record["desired"]
+        print(f"  {record['foot']:5s} plant@{record['plant_time']:.2f}s "
+              f"x={position[0]:.2f} -> {record['status']} "
+              f"({record['reason']}) slip={record['slip']:.3f}")
+
+    # Compare keeping the authored stride vs adjusting upcoming steps.
+    plans = tracker.compare_plans(4)
+    for strategy, steps in plans.items():
+        summary = ", ".join(
+            f"{s['foot']}:{s['status']}" for s in steps
+        )
+        print(f"  plan[{strategy}]: {summary}")
+
+    # Save with one foot planted and the other airborne, then reload.
+    saved_player = player.save_state()
+    saved_tracker = tracker.save_state()
+    clone = AnimationPlayer(library, "walk")
+    clone.load_state(saved_player)
+    clone_tracker = FootstepTracker(clone, feet, terrain)
+    clone_tracker.load_state(saved_tracker)
+    for _ in range(20):
+        tracker.update(0.05)
+        clone_tracker.update(0.05)
+    same = (
+        tracker.contact_history() == clone_tracker.contact_history()
+        and tracker.contact_report() == clone_tracker.contact_report()
+    )
+    print(f"footsteps: save/load mid-stride replays identically: {same}")
+
+    # Later terrain edits never rewrite confirmed contacts.
+    before = [dict(r) for r in tracker.contact_history()]
+    terrain.segments[1] = GroundSegment("curb", 3.0, 100.0, 0.9)
+    print(f"footsteps: history stable after terrain edit: "
+          f"{tracker.contact_history() == before}")
+
+
 if __name__ == "__main__":
     main()
     gait_phase_sync_demo()
     speed_schedule_demo()
+    footstep_constraint_demo()
