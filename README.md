@@ -57,6 +57,15 @@
 - `tracker.retract_observation(version)` 撤回观测并丢弃基于它的解释，受影响的待定记录自动回落到先前解释或原始待定状态，无关步态不变。
 - 回跳（反向播放或 seek）再前进不会重复产生接触：tracker 按步态相位水位线去重，与播放器事件规则一致；水位线、解释记录与地形观测都随 `save_state()`/`load_state()` 保存，连续运行、事件间存档重开、回跳再前进三种方式得到完全相同的落脚序列。
 
+## 冲突补测批次与按段解释
+
+相互矛盾的多批补测可以同时保留：`terrain.register_observation(segments, batch="survey_a")` 给观测打上批次标签，默认（全叠加）视图里最新登记生效，但 `terrain.snapshot(batch=...)` / `height_at(x, batch=...)` 只叠加基础层与指定批次，任一批次都能单独复现，`terrain.batch_versions(batch)` 列出该批存活的版本号。
+
+- `tracker.reinterpret(start, end, batch=...)` 按墙钟时间段选择用哪一批补测解释待定落脚：角色跨越缺口并中途变速时，可对缺口前段用一批、后段用另一批分别解释，比较结果后每段只采用其中一批；每条解释都记录来源（`batch` 与 `terrain_version`），经 `interpreted_history()` 查询。
+- 已确认的支撑始终是冻结的：最新登记的高度（哪怕把脚下地面改写成别的值）只计入返回值的 `frozen`，绝不回写历史；批次未观测到的位置继续保持待解释（`no_ground` / `unsatisfied`），不会被强行解释。
+- `tracker.retract_batch(batch)` 撤回整批观测，只丢弃依赖该批的解释，受影响记录回落到先前解释或原始待定状态；其他批次的选择与旧依据原样保留。`retract_observation(version)` 仍按单版本撤回。
+- 未决冲突随 `save_state()`/`load_state()` 完整保存：存档重开后再倒放、正放，记录数量、解释来源（批次）与连续播放结果完全一致；重开后批次仍可撤回。
+
 ## 连续性设计
 
 过渡不是简单平均两个姿态：新切换会先冻结“当前混合结果”的关节值、根速度和角速度，再向目标片段做 smoothstep 混合。根部位移按混合权重对速度积分，循环边界和关键帧边界自动分段，因此在旧过渡未完成时再次切换不会产生位置跳变。

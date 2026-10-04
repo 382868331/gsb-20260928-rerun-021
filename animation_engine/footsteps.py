@@ -75,9 +75,20 @@ class Terrain:
         """Version a new evaluation would be stamped with (0 = base only)."""
         return len(self._observations)
 
-    def register_observation(self, segments, note: str = None) -> int:
-        """Commit a surveyed revision; returns its 1-based version id."""
-        self._observations.append({"segments": list(segments), "note": note})
+    def register_observation(self, segments, note: str = None,
+                             batch: str = None) -> int:
+        """Commit a surveyed revision; returns its 1-based version id.
+
+        ``batch`` tags the observation as part of a named survey batch.
+        Conflicting batches coexist: the latest registration wins in the
+        default (fully stacked) view, but each batch stays selectable on
+        its own via ``snapshot(batch=...)`` / ``height_at(x, batch=...)``.
+        """
+        self._observations.append({
+            "segments": list(segments),
+            "note": note,
+            "batch": batch,
+        })
         return len(self._observations)
 
     def retract_observation(self, version: int):
@@ -88,8 +99,21 @@ class Terrain:
             raise ValueError(f"observation {version} already retracted")
         self._observations[version - 1] = None
 
-    def snapshot(self, version: int = None):
-        """Resolved segment list at the given version (default: latest)."""
+    def batch_versions(self, batch: str):
+        """1-based version ids of all live observations in a batch."""
+        return [
+            index + 1
+            for index, entry in enumerate(self._observations)
+            if entry is not None and entry.get("batch") == batch
+        ]
+
+    def snapshot(self, version: int = None, batch: str = None):
+        """Resolved segment list at the given version (default: latest).
+
+        With ``batch`` set, only that batch's observations are layered on
+        the base segments, so one of several conflicting surveys can be
+        selected without the others leaking into the evaluation.
+        """
         if version is None:
             version = len(self._observations)
         resolved = {segment.id: segment for segment in self.segments}
@@ -97,20 +121,22 @@ class Terrain:
         for entry in self._observations[:version]:
             if entry is None:
                 continue
+            if batch is not None and entry.get("batch") != batch:
+                continue
             for segment in entry["segments"]:
                 if segment.id not in resolved:
                     order.append(segment.id)
                 resolved[segment.id] = segment
         return [resolved[segment_id] for segment_id in order]
 
-    def segment_at(self, x: float, version: int = None):
-        for segment in self.snapshot(version):
+    def segment_at(self, x: float, version: int = None, batch: str = None):
+        for segment in self.snapshot(version, batch=batch):
             if segment.contains(x):
                 return segment
         return None
 
-    def height_at(self, x: float, version: int = None):
-        segment = self.segment_at(x, version)
+    def height_at(self, x: float, version: int = None, batch: str = None):
+        segment = self.segment_at(x, version, batch=batch)
         return None if segment is None else segment.height
 
     def save_state(self) -> dict:
@@ -295,8 +321,9 @@ class FootstepTracker:
 
     # -- contact lifecycle -----------------------------------------------
 
-    def _evaluate(self, spec, x: float, reference_height, version=None):
-        segment = self.terrain.segment_at(x, version)
+    def _evaluate(self, spec, x: float, reference_height, version=None,
+                  batch=None):
+        segment = self.terrain.segment_at(x, version, batch=batch)
         if segment is None:
             return None, NO_GROUND
         if spec.allowed_segments and segment.id not in spec.allowed_segments:
@@ -408,6 +435,7 @@ class FootstepTracker:
         view = dict(record)
         view["basis_reason"] = record["reason"]
         view["basis_terrain_version"] = record.get("terrain_version")
+        view["batch"] = None
         if record.get("interpretations"):
             view.update(record["interpretations"][-1])
         return view
@@ -417,15 +445,24 @@ class FootstepTracker:
         return [self.effective_record(record) for record in self.records]
 
     def reinterpret(self, start_time: float, end_time: float,
-                    version: int = None):
+                    version: int = None, batch: str = None):
         """Re-evaluate unsatisfied plants in a wall-clock span of history
-        against a (possibly newer) terrain version.
+        against a (possibly newer) terrain version or a named survey batch.
 
         Only unsatisfied records are eligible: confirmed supports are
         frozen and are never silently moved - they are counted in the
         result instead.  The original record keeps its basis; the new
-        outcome is appended to its interpretations list.
+        outcome is appended to its interpretations list together with the
+        source (version and batch) it was derived from.  Positions still
+        without any observation stay pending (unsatisfied / no_ground).
         """
+        if version is not None and batch is not None:
+            raise ValueError("pass either version or batch, not both")
+        if batch is not None:
+            versions = self.terrain.batch_versions(batch)
+            if not versions:
+                raise ValueError("unknown observation batch %r" % (batch,))
+            version = versions[-1]
         if version is None:
             version = self.terrain.current_version
         reinterpreted = 0
@@ -440,10 +477,12 @@ class FootstepTracker:
             spec = self.specs[record["foot"]]
             segment, reason = self._evaluate(
                 spec, record["desired"][0], record["reference_height"],
-                version=version,
+                version=None if batch is not None else version,
+                batch=batch,
             )
             record["interpretations"].append({
                 "terrain_version": version,
+                "batch": batch,
                 "reason": reason,
                 "status": "satisfied" if reason == OK else "unsatisfied",
                 "position": record["desired"] if reason == OK else None,
@@ -471,6 +510,31 @@ class FootstepTracker:
             kept = [
                 entry for entry in record["interpretations"]
                 if entry["terrain_version"] != version
+            ]
+            if len(kept) != len(record["interpretations"]):
+                record["interpretations"] = kept
+                restored += 1
+        return restored
+
+    def retract_batch(self, batch: str):
+        """Withdraw a whole survey batch and restore dependent records.
+
+        Every live observation of the batch is retracted and only the
+        interpretations that were derived from this batch are dropped;
+        explanations sourced from other batches and the original bases
+        stay in place.  Returns the number of records restored.
+        """
+        versions = self.terrain.batch_versions(batch)
+        if not versions:
+            raise ValueError("unknown observation batch %r" % (batch,))
+        for version in versions:
+            self.terrain.retract_observation(version)
+        restored = 0
+        for record in self.records:
+            kept = [
+                entry for entry in record["interpretations"]
+                if entry.get("batch") != batch
+                and entry["terrain_version"] not in versions
             ]
             if len(kept) != len(record["interpretations"]):
                 record["interpretations"] = kept

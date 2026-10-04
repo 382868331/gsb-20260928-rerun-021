@@ -256,5 +256,311 @@ class DeterminismTest(unittest.TestCase):
         self.assertEqual(len(pending), len(explained))
 
 
+
+def assert_interpreted_almost_equal(testcase, views_a, views_b):
+    testcase.assertEqual(len(views_a), len(views_b))
+    for va, vb in zip(views_a, views_b):
+        testcase.assertEqual(set(va), set(vb))
+        for key in va:
+            xa, xb = va[key], vb[key]
+            if xa is None or xb is None:
+                testcase.assertEqual(xa, xb)
+            elif isinstance(xa, float):
+                testcase.assertAlmostEqual(xa, xb, places=9)
+            elif isinstance(xa, tuple):
+                testcase.assertEqual(len(xa), len(xb))
+                for ya, yb in zip(xa, xb):
+                    testcase.assertAlmostEqual(ya, yb, places=9)
+            else:
+                testcase.assertEqual(xa, xb)
+
+
+class ConflictingBatchesTest(unittest.TestCase):
+    """Two contradictory survey batches are kept side by side; each time
+    span of history picks which batch explains it."""
+
+    def setUp(self):
+        self.terrain = gapped_terrain()
+        self.player, self.tracker = make_tracker(self.terrain)
+        run(self.tracker, 3.0)
+        self.gap_records = [
+            r for r in self.tracker.contact_history()
+            if r["reason"] == "no_ground"
+        ]
+        self.assertGreaterEqual(len(self.gap_records), 2)
+        # Two conflicting surveys of the same gap: different heights and
+        # different coverage, registered as separate batches.
+        self.terrain.register_observation(
+            [GroundSegment("deck", 2.0, 3.0, 0.4)], batch="survey_a"
+        )
+        self.terrain.register_observation(
+            [GroundSegment("deck", 2.0, 3.0, 0.9),
+             GroundSegment("far", 3.0, 100.0, 0.9)],
+            batch="survey_b",
+        )
+
+    def split_point(self):
+        times = sorted(r["plant_time"] for r in self.gap_records)
+        k = len(times) // 2
+        return (times[k - 1] + times[k]) / 2.0
+
+    def test_conflicting_batches_coexist(self):
+        # The latest registration wins in the fully stacked default view.
+        self.assertEqual(self.terrain.height_at(2.5), 0.9)
+        # Each batch stays selectable on its own, conflict preserved.
+        self.assertEqual(self.terrain.height_at(2.5, batch="survey_a"), 0.4)
+        self.assertEqual(self.terrain.height_at(2.5, batch="survey_b"), 0.9)
+        self.assertEqual(self.terrain.height_at(3.5, batch="survey_a"), 0.0)
+        self.assertEqual(self.terrain.height_at(3.5, batch="survey_b"), 0.9)
+        self.assertEqual(self.terrain.batch_versions("survey_a"), [1])
+        self.assertEqual(self.terrain.batch_versions("survey_b"), [2])
+
+    def test_select_batch_per_time_span(self):
+        mid = self.split_point()
+        clock = self.tracker.clock
+        result_a = self.tracker.reinterpret(0.0, mid, batch="survey_a")
+        result_b = self.tracker.reinterpret(mid, clock, batch="survey_b")
+        self.assertGreater(result_a["reinterpreted"], 0)
+        self.assertGreater(result_b["reinterpreted"], 0)
+        # Confirmed supports are frozen in both passes, never moved.
+        self.assertGreater(result_a["frozen"], 0)
+        self.assertGreater(result_b["frozen"], 0)
+
+        views = {
+            r["plant_time"]: r for r in self.tracker.interpreted_history()
+        }
+        for record in self.gap_records:
+            view = views[record["plant_time"]]
+            self.assertEqual(view["basis_reason"], "no_ground")
+            self.assertEqual(view["basis_terrain_version"], 0)
+            if record["plant_time"] <= mid:
+                # Earlier span explained by survey_a only.
+                self.assertEqual(view["batch"], "survey_a")
+                self.assertEqual(view["reason"], "ok")
+                self.assertAlmostEqual(view["height"], 0.4)
+            else:
+                # Later span explained by survey_b only.
+                self.assertEqual(view["batch"], "survey_b")
+                self.assertEqual(view["reason"], "ok")
+                self.assertAlmostEqual(view["height"], 0.9)
+
+    def test_latest_registration_does_not_override_confirmed_support(self):
+        # A newer batch revising ground a foot already stands on must not
+        # rewrite the confirmed support.
+        self.terrain.register_observation(
+            [GroundSegment("near", -10.0, 2.0, 9.9)], batch="survey_c"
+        )
+        result = self.tracker.reinterpret(
+            0.0, self.tracker.clock, batch="survey_c"
+        )
+        satisfied = [
+            r for r in self.tracker.interpreted_history()
+            if r["basis_reason"] == "ok"
+        ]
+        self.assertTrue(satisfied)
+        self.assertEqual(result["frozen"], len(satisfied))
+        for view in satisfied:
+            self.assertEqual(view["reason"], "ok")
+            self.assertAlmostEqual(view["height"], 0.0)
+        # The new batch says nothing about the gap: those records stay
+        # pending instead of being force-explained.
+        for record in self.gap_records:
+            view = [
+                r for r in self.tracker.interpreted_history()
+                if r["plant_time"] == record["plant_time"]
+            ][0]
+            self.assertEqual(view["reason"], "no_ground")
+            self.assertEqual(view["status"], "unsatisfied")
+
+    def test_partially_observed_positions_stay_pending(self):
+        # A batch covering only part of the gap explains only what it
+        # observes; the rest keeps its pending no_ground state.
+        self.terrain.register_observation(
+            [GroundSegment("ledge", 2.0, 2.4, 0.3)], batch="partial"
+        )
+        self.tracker.reinterpret(0.0, self.tracker.clock, batch="partial")
+        views = [
+            r for r in self.tracker.interpreted_history()
+            if r["basis_reason"] == "no_ground"
+        ]
+        explained = [v for v in views if v["reason"] == "ok"]
+        pending = [v for v in views if v["reason"] == "no_ground"]
+        self.assertTrue(explained)
+        self.assertTrue(pending)
+        for view in pending:
+            self.assertEqual(view["status"], "unsatisfied")
+            self.assertIsNone(view["position"])
+            self.assertEqual(view["batch"], "partial")
+
+    def test_retract_batch_restores_only_dependents(self):
+        mid = self.split_point()
+        clock = self.tracker.clock
+        self.tracker.reinterpret(0.0, mid, batch="survey_a")
+        self.tracker.reinterpret(mid, clock, batch="survey_b")
+        before = self.tracker.interpreted_history()
+
+        restored = self.tracker.retract_batch("survey_b")
+        self.assertGreater(restored, 0)
+        # Batch b is gone from the terrain; batch a still applies.
+        self.assertEqual(self.terrain.height_at(2.5), 0.4)
+        with self.assertRaises(ValueError):
+            self.tracker.retract_batch("survey_b")
+
+        views = self.tracker.interpreted_history()
+        for old, view in zip(before, views):
+            if old["basis_reason"] == "ok":
+                # Confirmed supports were never touched.
+                self.assertEqual(old, view)
+            elif old["plant_time"] <= mid:
+                # survey_a explanations survive the retraction of b.
+                self.assertEqual(view["batch"], "survey_a")
+                self.assertEqual(view["reason"], "ok")
+                self.assertAlmostEqual(view["height"], 0.4)
+            else:
+                # Dependents of survey_b fall back to pending.
+                self.assertEqual(view["reason"], "no_ground")
+                self.assertEqual(view["status"], "unsatisfied")
+                self.assertIsNone(view["batch"])
+
+    def test_retract_single_version_keeps_sibling_batch(self):
+        mid = self.split_point()
+        clock = self.tracker.clock
+        self.tracker.reinterpret(0.0, mid, batch="survey_a")
+        self.tracker.reinterpret(mid, clock, batch="survey_b")
+        # Retracting only version 1 (survey_a) leaves survey_b choices.
+        self.tracker.retract_observation(1)
+        views = self.tracker.interpreted_history()
+        for view in views:
+            if view["basis_reason"] != "no_ground":
+                continue
+            if view["plant_time"] <= mid:
+                self.assertEqual(view["reason"], "no_ground")
+            else:
+                self.assertEqual(view["batch"], "survey_b")
+                self.assertAlmostEqual(view["height"], 0.9)
+
+
+class BatchPersistenceTest(unittest.TestCase):
+    """Pending conflicts survive save/load; rewind and replay stay
+    identical to continuous playback in count, source and outcome."""
+
+    def scenario(self, rewind=False, snapshots=False):
+        terrain = gapped_terrain()
+        player, tracker = make_tracker(terrain)
+        saved = []
+
+        def checkpoint():
+            if snapshots:
+                saved.append((player.save_state(), tracker.save_state()))
+
+        run(tracker, 1.6)
+        checkpoint()
+        # First survey batch (partial coverage of the gap), then a
+        # mid-run speed change.
+        terrain.register_observation(
+            [GroundSegment("deck", 2.0, 2.5, 0.4)], batch="survey_a"
+        )
+        player.set_speed_schedule([(0.5, 0.5), (1.0, 2.0)])
+        run(tracker, 1.6)
+        checkpoint()
+        # A second, conflicting batch registered later.
+        terrain.register_observation(
+            [GroundSegment("deck", 2.0, 3.0, 0.9)], batch="survey_b"
+        )
+        run(tracker, 1.0)
+        if rewind:
+            tracker.update(-0.9)  # back over derived contacts
+            tracker.update(0.9)   # forward again: no duplicates
+        gaps = [
+            r for r in tracker.contact_history() if r["reason"] == "no_ground"
+        ]
+        self.assertTrue(gaps)
+        times = sorted(r["plant_time"] for r in gaps)
+        self.assertGreaterEqual(len(times), 2)
+        k = len(times) // 2
+        mid = (times[k - 1] + times[k]) / 2.0
+        tracker.reinterpret(0.0, mid, batch="survey_a")
+        tracker.reinterpret(mid, tracker.clock, batch="survey_b")
+        checkpoint()
+        run(tracker, 1.2)
+        return tracker, saved
+
+    def sources(self, tracker):
+        return [
+            (r["plant_time"], r["foot"], r["reason"], r["batch"])
+            for r in tracker.interpreted_history()
+        ]
+
+    def test_rewind_and_forward_matches_continuous(self):
+        continuous, _ = self.scenario()
+        rewound, _ = self.scenario(rewind=True)
+        self.assertEqual(
+            len(continuous.contact_history()), len(rewound.contact_history())
+        )
+        assert_records_almost_equal(
+            self, continuous.contact_history(), rewound.contact_history()
+        )
+        assert_interpreted_almost_equal(
+            self, continuous.interpreted_history(), rewound.interpreted_history()
+        )
+
+    def test_save_load_with_pending_conflicts_matches_continuous(self):
+        continuous, saved = self.scenario(snapshots=True)
+        self.assertEqual(len(saved), 3)
+
+        library = build_demo_library()
+        player2 = AnimationPlayer(library, "walk")
+        tracker2 = FootstepTracker(player2, make_feet(), gapped_terrain())
+        player2.load_state(saved[-1][0])
+        tracker2.load_state(saved[-1][1])
+        run(tracker2, 1.2)
+
+        self.assertEqual(
+            len(continuous.contact_history()), len(tracker2.contact_history())
+        )
+        assert_records_almost_equal(
+            self, continuous.contact_history(), tracker2.contact_history()
+        )
+        assert_interpreted_almost_equal(
+            self, continuous.interpreted_history(), tracker2.interpreted_history()
+        )
+        self.assertEqual(self.sources(continuous), self.sources(tracker2))
+
+    def test_reloaded_batches_remain_retractable(self):
+        _, saved = self.scenario(snapshots=True)
+        library = build_demo_library()
+        player2 = AnimationPlayer(library, "walk")
+        tracker2 = FootstepTracker(player2, make_feet(), gapped_terrain())
+        player2.load_state(saved[-1][0])
+        tracker2.load_state(saved[-1][1])
+
+        views_before = tracker2.interpreted_history()
+        explained_b = [
+            r for r in views_before
+            if r.get("batch") == "survey_b" and r["reason"] == "ok"
+        ]
+        explained_a = [
+            r for r in views_before
+            if r.get("batch") == "survey_a" and r["reason"] == "ok"
+        ]
+        pending_before = [
+            r for r in views_before if r["reason"] == "no_ground"
+        ]
+        self.assertTrue(explained_a)
+        self.assertTrue(explained_b)
+        restored = tracker2.retract_batch("survey_b")
+        self.assertEqual(restored, len(explained_b))
+        still_a = [
+            r for r in tracker2.interpreted_history()
+            if r.get("batch") == "survey_a" and r["reason"] == "ok"
+        ]
+        self.assertEqual(len(still_a), len(explained_a))
+        pending = [
+            r for r in tracker2.interpreted_history()
+            if r["reason"] == "no_ground"
+        ]
+        self.assertEqual(len(pending), len(pending_before) + len(explained_b))
+
+
 if __name__ == "__main__":
     unittest.main()
