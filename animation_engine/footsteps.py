@@ -75,10 +75,22 @@ class Terrain:
         """Version a new evaluation would be stamped with (0 = base only)."""
         return len(self._observations)
 
-    def register_observation(self, segments, note: str = None) -> int:
+    def register_observation(self, segments, note: str = None,
+                             source: str = None) -> int:
         """Commit a surveyed revision; returns its 1-based version id."""
-        self._observations.append({"segments": list(segments), "note": note})
+        self._observations.append({
+            "segments": list(segments),
+            "note": note,
+            "source": note if source is None else source,
+        })
         return len(self._observations)
+
+    def observation(self, version: int):
+        """Return stored metadata for a registered observation."""
+        if not 1 <= version <= len(self._observations):
+            raise ValueError(f"unknown observation version {version}")
+        entry = self._observations[version - 1]
+        return None if entry is None else dict(entry)
 
     def retract_observation(self, version: int):
         """Withdraw a previously registered observation."""
@@ -103,8 +115,31 @@ class Terrain:
                 resolved[segment.id] = segment
         return [resolved[segment_id] for segment_id in order]
 
+    def observation_snapshot(self, version: int):
+        """Base terrain with only one survey batch applied.
+
+        Ordinary version snapshots are cumulative and reproduce knowledge at
+        a registration time.  Candidate explanations for conflicting
+        surveys instead need each batch evaluated independently.
+        """
+        entry = self.observation(version)
+        resolved = {segment.id: segment for segment in self.segments}
+        order = [segment.id for segment in self.segments]
+        if entry is not None:
+            for segment in entry["segments"]:
+                if segment.id not in resolved:
+                    order.append(segment.id)
+                resolved[segment.id] = segment
+        return [resolved[segment_id] for segment_id in order]
+
     def segment_at(self, x: float, version: int = None):
         for segment in self.snapshot(version):
+            if segment.contains(x):
+                return segment
+        return None
+
+    def segment_in_observation(self, x: float, version: int):
+        for segment in self.observation_snapshot(version):
             if segment.contains(x):
                 return segment
         return None
@@ -295,8 +330,12 @@ class FootstepTracker:
 
     # -- contact lifecycle -----------------------------------------------
 
-    def _evaluate(self, spec, x: float, reference_height, version=None):
-        segment = self.terrain.segment_at(x, version)
+    def _evaluate(self, spec, x: float, reference_height, version=None,
+                  observation_only=False):
+        if version is not None and observation_only:
+            segment = self.terrain.segment_in_observation(x, version)
+        else:
+            segment = self.terrain.segment_at(x, version)
         if segment is None:
             return None, NO_GROUND
         if spec.allowed_segments and segment.id not in spec.allowed_segments:
@@ -335,6 +374,7 @@ class FootstepTracker:
             "reference_height": self.reference_height,
             # Re-interpretations registered afterwards, newest last.
             "interpretations": [],
+            "selected_terrain_version": None,
         }
         foot["record"] = record
         foot["plant_time"] = wall_time
@@ -399,7 +439,7 @@ class FootstepTracker:
 
     @staticmethod
     def effective_record(record):
-        """Current explanation of a record: latest interpretation applied.
+        """Current explanation of a record: selected interpretation applied.
 
         The original fields (the basis at plant time) are never touched;
         the view adds them under basis_* keys so both the original
@@ -408,28 +448,46 @@ class FootstepTracker:
         view = dict(record)
         view["basis_reason"] = record["reason"]
         view["basis_terrain_version"] = record.get("terrain_version")
-        if record.get("interpretations"):
-            view.update(record["interpretations"][-1])
+        selected_version = record.get("selected_terrain_version")
+        selected = None
+        if selected_version is not None:
+            selected = next((
+                entry for entry in record.get("interpretations", [])
+                if entry["terrain_version"] == selected_version
+            ), None)
+        if selected is None and "selected_terrain_version" not in record:
+            # Backward compatibility for older saved records.
+            candidates = record.get("interpretations", [])
+            selected = candidates[-1] if candidates else None
+        if selected is not None:
+            view.update(selected)
+            view["selected_terrain_version"] = selected["terrain_version"]
         return view
 
     def interpreted_history(self):
-        """Closed records under their current (latest) explanation."""
+        """Closed records under their current selected explanation."""
         return [self.effective_record(record) for record in self.records]
 
     def reinterpret(self, start_time: float, end_time: float,
-                    version: int = None):
+                    version: int = None, adopt: bool = None):
         """Re-evaluate unsatisfied plants in a wall-clock span of history
         against a (possibly newer) terrain version.
 
-        Only unsatisfied records are eligible: confirmed supports are
-        frozen and are never silently moved - they are counted in the
-        result instead.  The original record keeps its basis; the new
-        outcome is appended to its interpretations list.
+        Conflicting surveys are retained as candidates.  The first
+        successful candidate is adopted by default, but a newer candidate
+        never replaces an adopted one.  Use adopt=False to compare without
+        adopting, or select_interpretation() for a later time-span choice.
         """
         if version is None:
             version = self.terrain.current_version
+        observation = self.terrain.observation(version)
+        if observation is None:
+            raise ValueError(f"observation {version} has been retracted")
+        source = None if observation is None else observation.get("source")
         reinterpreted = 0
         frozen = 0
+        adopted = 0
+        pending = 0
         for record in self.records:
             plant_time = record["plant_time"]
             if not (start_time - _EPS <= plant_time <= end_time + _EPS):
@@ -441,20 +499,94 @@ class FootstepTracker:
             segment, reason = self._evaluate(
                 spec, record["desired"][0], record["reference_height"],
                 version=version,
+                observation_only=True,
             )
-            record["interpretations"].append({
+            candidate = {
                 "terrain_version": version,
+                "source": source,
                 "reason": reason,
                 "status": "satisfied" if reason == OK else "unsatisfied",
                 "position": record["desired"] if reason == OK else None,
                 "height": segment.height if (segment and reason == OK) else None,
                 "segment_id": segment.id if (segment and reason == OK) else None,
-            })
+            }
+            existing = next((
+                entry for entry in record["interpretations"]
+                if entry["terrain_version"] == version
+            ), None)
+            if existing is None:
+                record["interpretations"].append(candidate)
+            else:
+                existing.clear()
+                existing.update(candidate)
             reinterpreted += 1
+            should_adopt = (
+                adopt is True
+                or (adopt is None
+                    and reason == OK
+                    and record.get("selected_terrain_version") is None)
+            )
+            if should_adopt and reason == OK:
+                record["selected_terrain_version"] = version
+                adopted += 1
+            elif reason != OK and record.get("selected_terrain_version") is None:
+                pending += 1
         return {
             "reinterpreted": reinterpreted,
             "frozen": frozen,
+            "adopted": adopted,
+            "pending": pending,
             "terrain_version": version,
+            "source": source,
+        }
+
+    def select_interpretation(self, start_time: float, end_time: float,
+                              version: int):
+        """Adopt one survey batch for unsatisfied records in a time span.
+
+        Successful candidates are selected.  Positions not covered by that
+        batch remain pending or keep a previously selected explanation.
+        Original confirmed supports are frozen and only counted.
+        """
+        selected = 0
+        pending = 0
+        frozen = 0
+        for record in self.records:
+            plant_time = record["plant_time"]
+            if not (start_time - _EPS <= plant_time <= end_time + _EPS):
+                continue
+            if record["reason"] == OK:
+                frozen += 1
+                continue
+            candidate = next((
+                entry for entry in record.get("interpretations", [])
+                if entry["terrain_version"] == version
+            ), None)
+            if candidate is None:
+                raise ValueError(
+                    f"observation {version} has not been evaluated for a "
+                    "record in this span; call reinterpret() first"
+                )
+            if candidate["reason"] == OK:
+                record["selected_terrain_version"] = version
+                selected += 1
+            else:
+                pending += 1
+        return {
+            "selected": selected,
+            "pending": pending,
+            "frozen": frozen,
+            "terrain_version": version,
+        }
+
+    def compare_interpretations(self, start_time: float, end_time: float,
+                                versions):
+        """Evaluate conflicting batches without changing adopted choices."""
+        return {
+            version: self.reinterpret(
+                start_time, end_time, version=version, adopt=False
+            )
+            for version in versions
         }
 
     def retract_observation(self, version: int):
@@ -468,13 +600,16 @@ class FootstepTracker:
         self.terrain.retract_observation(version)
         restored = 0
         for record in self.records:
+            was_selected = record.get("selected_terrain_version") == version
             kept = [
                 entry for entry in record["interpretations"]
                 if entry["terrain_version"] != version
             ]
             if len(kept) != len(record["interpretations"]):
                 record["interpretations"] = kept
-                restored += 1
+                if was_selected:
+                    record.pop("selected_terrain_version", None)
+                    restored += 1
         return restored
 
     # -- planning --------------------------------------------------------

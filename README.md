@@ -49,12 +49,13 @@
 
 ## 地形观测版本与历史重解释
 
-地形知识以可登记、可撤回的观测版本增长：`terrain.register_observation(segments, note=None)` 提交一次补测（填入新片段补缺口，或以同 id 片段修订高度），返回从 1 开始的版本号；观测按登记顺序叠加在基础层之上，`terrain.snapshot(version)` / `height_at(x, version)` 可复现任意历史版本，`retract_observation(version)` 撤回某次补测且其余版本号保持稳定。
+地形知识以可登记、可撤回的观测版本增长：`terrain.register_observation(segments, note=None, source=None)` 提交一次补测（填入新片段补缺口，或以同 id 片段修订高度），返回从 1 开始的版本号；`source` 标识补测批次并随解释保存。观测按登记顺序叠加在基础层之上，`terrain.snapshot(version)` / `height_at(x, version)` 可复现任意历史版本，`retract_observation(version)` 撤回某次补测且其余版本号保持稳定。
 
 - 每条落脚记录都盖章当时的 `terrain_version` 与参考高度作为依据；登记新观测默认只影响未来落脚，绝不回写历史。
-- `tracker.reinterpret(start, end, version=None)` 用指定（默认最新）地形版本重新评估该墙钟区间内**未满足**的落脚：结果追加到记录的 `interpretations`，原记录保持原样。已确认的支撑是冻结的——不会被静默移动，只在返回值的 `frozen` 计数中报告。
-- 原始记录经 `contact_history()` 查询（保留当时的 no_ground 依据），最新解释经 `interpreted_history()` 查询（含 `basis_reason` / `basis_terrain_version` 与原依据对照）。
-- `tracker.retract_observation(version)` 撤回观测并丢弃基于它的解释，受影响的待定记录自动回落到先前解释或原始待定状态，无关步态不变。
+- `tracker.reinterpret(start, end, version=None, adopt=None)` 用指定（默认最新）地形版本重新评估该墙钟区间内**未满足**的落脚：结果追加或更新为该版本的候选解释，原记录保持原样。首个成功候选默认采用；登记更新的补测不会自动覆盖已经采用的支撑。传 `adopt=False` 可只比较不采用，传 `adopt=True` 可强制采用该版本。已确认的支撑是冻结的——不会被静默移动，只在返回值的 `frozen` 计数中报告。
+- `tracker.compare_interpretations(start, end, versions)` 可同时保留多批相互冲突的高度/覆盖范围补测；`tracker.select_interpretation(start, end, version)` 再按墙钟时间段显式采用某一批。某批未覆盖的位置保持待解释或继续使用已采用的旧依据，不会因版本号更新而被覆盖。
+- 原始记录经 `contact_history()` 查询（保留当时的 no_ground 依据），当前采用的解释经 `interpreted_history()` 查询（含 `source`、`selected_terrain_version`、`basis_reason` / `basis_terrain_version` 与原依据对照）。
+- `tracker.retract_observation(version)` 撤回观测并清理基于它的候选；只有真正依赖该版本的当前解释会恢复到先前解释或原始待定状态，其他时间段的选择与旧依据保留。
 - 回跳（反向播放或 seek）再前进不会重复产生接触：tracker 按步态相位水位线去重，与播放器事件规则一致；水位线、解释记录与地形观测都随 `save_state()`/`load_state()` 保存，连续运行、事件间存档重开、回跳再前进三种方式得到完全相同的落脚序列。
 
 ## 连续性设计

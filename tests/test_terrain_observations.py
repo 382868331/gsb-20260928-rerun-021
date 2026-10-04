@@ -256,5 +256,138 @@ class DeterminismTest(unittest.TestCase):
         self.assertEqual(len(pending), len(explained))
 
 
+class ConflictingObservationTest(unittest.TestCase):
+    def test_select_conflicting_surveys_by_time_and_retract_only_dependency(self):
+        terrain = gapped_terrain()
+        player, tracker = make_tracker(terrain)
+        run(tracker, 1.4)
+        # Cross the gap while changing speed part-way through.
+        player.set_speed_schedule([(0.5, 0.5), (1.0, 2.0)])
+        run(tracker, 1.6)
+
+        gaps = [r for r in tracker.contact_history() if r["reason"] == "no_ground"]
+        self.assertEqual(len(gaps), 2)
+        first_time, second_time = [r["plant_time"] for r in gaps]
+
+        low_version = terrain.register_observation(
+            [GroundSegment("batch_a", 2.0, 2.5, 0.4)],
+            note="low batch", source="survey-a",
+        )
+        high_version = terrain.register_observation(
+            [GroundSegment("batch_b", 2.5, 3.0, 0.9)],
+            note="high batch", source="survey-b",
+        )
+
+        comparison = tracker.compare_interpretations(
+            first_time, second_time, [low_version, high_version]
+        )
+        self.assertEqual(comparison[low_version]["adopted"], 0)
+        self.assertEqual(comparison[high_version]["adopted"], 0)
+
+        # The newest registration does not automatically win.  Each time
+        # span explicitly chooses the batch that actually covers it.
+        self.assertEqual(
+            tracker.select_interpretation(
+                first_time, first_time, low_version
+            )["selected"],
+            1,
+        )
+        self.assertEqual(
+            tracker.select_interpretation(
+                second_time, second_time, high_version
+            )["selected"],
+            1,
+        )
+
+        views_by_time = {
+            view["plant_time"]: view
+            for view in tracker.interpreted_history()
+            if view["basis_reason"] == "no_ground"
+        }
+        first = views_by_time[first_time]
+        second = views_by_time[second_time]
+        self.assertEqual(first["segment_id"], "batch_a")
+        self.assertEqual(first["source"], "survey-a")
+        self.assertAlmostEqual(first["height"], 0.4)
+        self.assertEqual(first["selected_terrain_version"], low_version)
+        self.assertEqual(second["segment_id"], "batch_b")
+        self.assertEqual(second["source"], "survey-b")
+        self.assertAlmostEqual(second["height"], 0.9)
+        self.assertEqual(second["selected_terrain_version"], high_version)
+
+        # Withdraw the low batch: only its dependent explanation is removed.
+        # The first point is pending again, while the high batch survives.
+        restored = tracker.retract_observation(low_version)
+        self.assertEqual(restored, 1)
+        views_by_time = {
+            view["plant_time"]: view
+            for view in tracker.interpreted_history()
+            if view["basis_reason"] == "no_ground"
+        }
+        self.assertEqual(views_by_time[first_time]["reason"], "no_ground")
+        self.assertIsNone(views_by_time[first_time]["position"])
+        self.assertEqual(views_by_time[second_time]["reason"], "ok")
+        self.assertEqual(views_by_time[second_time]["source"], "survey-b")
+
+    def test_unresolved_conflicts_survive_reload_rewind_and_forward(self):
+        def build(rewind_after_load=False):
+            terrain = gapped_terrain()
+            player, tracker = make_tracker(terrain)
+            run(tracker, 1.4)
+            player.set_speed_schedule([(0.5, 0.5), (1.0, 2.0)])
+            run(tracker, 1.6)
+            gaps = [
+                record for record in tracker.contact_history()
+                if record["reason"] == "no_ground"
+            ]
+            first_time, second_time = [r["plant_time"] for r in gaps]
+            low_version = terrain.register_observation(
+                [GroundSegment("batch_a", 2.0, 2.5, 0.4)],
+                source="survey-a",
+            )
+            high_version = terrain.register_observation(
+                [GroundSegment("batch_b", 2.5, 3.0, 0.9)],
+                source="survey-b",
+            )
+            tracker.compare_interpretations(
+                first_time, second_time, [low_version, high_version]
+            )
+            saved_player = player.save_state()
+            saved_tracker = tracker.save_state()
+            if rewind_after_load:
+                player2 = AnimationPlayer(build_demo_library(), "walk")
+                tracker2 = FootstepTracker(
+                    player2, make_feet(), gapped_terrain()
+                )
+                player2.load_state(saved_player)
+                tracker2.load_state(saved_tracker)
+                tracker2.update(-0.9)
+                tracker2.update(0.9)
+                player, tracker = player2, tracker2
+            tracker.select_interpretation(
+                first_time, first_time, low_version
+            )
+            tracker.select_interpretation(
+                second_time, second_time, high_version
+            )
+            return tracker
+
+        continuous = build()
+        rewound = build(rewind_after_load=True)
+        self.assertEqual(
+            len(continuous.contact_history()),
+            len(rewound.contact_history()),
+        )
+        assert_records_almost_equal(
+            self,
+            continuous.contact_history(),
+            rewound.contact_history(),
+        )
+        self.assertEqual(
+            continuous.interpreted_history(),
+            rewound.interpreted_history(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
