@@ -53,20 +53,81 @@ class GroundSegment:
 
 
 class Terrain:
-    """Piecewise-flat ground profile; deliberately editable between runs."""
+    """Piecewise-flat ground profile; deliberately editable between runs.
+
+    Beyond direct edits of the base segments list, terrain knowledge can
+    grow through *registered observations*: each observation is a
+    numbered, retract-able revision that adds segments (filling gaps) or
+    replaces same-id segments (revising heights).  Observations apply on
+    top of the base layer in registration order, so every version of the
+    terrain stays reproducible and a footfall record can name the exact
+    version it was evaluated against.
+    """
 
     def __init__(self, segments):
         self.segments = list(segments)
+        # Registered observations; a retracted entry becomes None so the
+        # remaining version numbers stay stable for records citing them.
+        self._observations = []
 
-    def segment_at(self, x: float):
-        for segment in self.segments:
+    @property
+    def current_version(self) -> int:
+        """Version a new evaluation would be stamped with (0 = base only)."""
+        return len(self._observations)
+
+    def register_observation(self, segments, note: str = None) -> int:
+        """Commit a surveyed revision; returns its 1-based version id."""
+        self._observations.append({"segments": list(segments), "note": note})
+        return len(self._observations)
+
+    def retract_observation(self, version: int):
+        """Withdraw a previously registered observation."""
+        if not 1 <= version <= len(self._observations):
+            raise ValueError(f"unknown observation version {version}")
+        if self._observations[version - 1] is None:
+            raise ValueError(f"observation {version} already retracted")
+        self._observations[version - 1] = None
+
+    def snapshot(self, version: int = None):
+        """Resolved segment list at the given version (default: latest)."""
+        if version is None:
+            version = len(self._observations)
+        resolved = {segment.id: segment for segment in self.segments}
+        order = [segment.id for segment in self.segments]
+        for entry in self._observations[:version]:
+            if entry is None:
+                continue
+            for segment in entry["segments"]:
+                if segment.id not in resolved:
+                    order.append(segment.id)
+                resolved[segment.id] = segment
+        return [resolved[segment_id] for segment_id in order]
+
+    def segment_at(self, x: float, version: int = None):
+        for segment in self.snapshot(version):
             if segment.contains(x):
                 return segment
         return None
 
-    def height_at(self, x: float):
-        segment = self.segment_at(x)
+    def height_at(self, x: float, version: int = None):
+        segment = self.segment_at(x, version)
         return None if segment is None else segment.height
+
+    def save_state(self) -> dict:
+        return {
+            "segments": list(self.segments),
+            "observations": [
+                None if entry is None else dict(entry)
+                for entry in self._observations
+            ],
+        }
+
+    def load_state(self, data: dict):
+        self.segments = list(data["segments"])
+        self._observations = [
+            None if entry is None else dict(entry)
+            for entry in data.get("observations", [])
+        ]
 
 
 @dataclass(frozen=True)
@@ -116,6 +177,12 @@ class FootstepTracker:
         self.reference_height = None
         # Closed contact records; append-only history.
         self.records = []
+        # Watermark (in unwrapped stride-phase units) up to which contact
+        # events have already been derived for the current clip.  Rewind
+        # or seek-back followed by forward replay must not re-derive
+        # crossings at or below it, mirroring the player event rules.
+        self._derived_until = None
+        self._derived_clip = None
 
     # -- phase helpers ---------------------------------------------------
 
@@ -185,6 +252,13 @@ class FootstepTracker:
         marker, period = window
         u0 = (t0 - marker.t) / period
         u1 = (t1 - marker.t) / period
+        clip_name = self.player.state.clip_name
+        if self._derived_clip != clip_name:
+            self._derived_clip = clip_name
+            self._derived_until = None
+        if self._derived_until is not None:
+            u0 = max(u0, self._derived_until)
+        self._derived_until = u1
 
         events = []
         for spec in self.specs.values():
@@ -221,8 +295,8 @@ class FootstepTracker:
 
     # -- contact lifecycle -----------------------------------------------
 
-    def _evaluate(self, spec, x: float, reference_height):
-        segment = self.terrain.segment_at(x)
+    def _evaluate(self, spec, x: float, reference_height, version=None):
+        segment = self.terrain.segment_at(x, version)
         if segment is None:
             return None, NO_GROUND
         if spec.allowed_segments and segment.id not in spec.allowed_segments:
@@ -254,6 +328,13 @@ class FootstepTracker:
             "reason": reason,
             "slip": 0.0,
             "status": "active",
+            # Basis the evaluation was made against: the terrain version
+            # and the reference height in force at plant time.  Later
+            # observations never rewrite these fields.
+            "terrain_version": self.terrain.current_version,
+            "reference_height": self.reference_height,
+            # Re-interpretations registered afterwards, newest last.
+            "interpretations": [],
         }
         foot["record"] = record
         foot["plant_time"] = wall_time
@@ -313,6 +394,88 @@ class FootstepTracker:
     def contact_history(self):
         """Closed contact records, oldest first; append-only."""
         return list(self.records)
+
+    # -- reinterpretation ------------------------------------------------
+
+    @staticmethod
+    def effective_record(record):
+        """Current explanation of a record: latest interpretation applied.
+
+        The original fields (the basis at plant time) are never touched;
+        the view adds them under basis_* keys so both the original
+        no_ground and the new explanation stay queryable.
+        """
+        view = dict(record)
+        view["basis_reason"] = record["reason"]
+        view["basis_terrain_version"] = record.get("terrain_version")
+        if record.get("interpretations"):
+            view.update(record["interpretations"][-1])
+        return view
+
+    def interpreted_history(self):
+        """Closed records under their current (latest) explanation."""
+        return [self.effective_record(record) for record in self.records]
+
+    def reinterpret(self, start_time: float, end_time: float,
+                    version: int = None):
+        """Re-evaluate unsatisfied plants in a wall-clock span of history
+        against a (possibly newer) terrain version.
+
+        Only unsatisfied records are eligible: confirmed supports are
+        frozen and are never silently moved - they are counted in the
+        result instead.  The original record keeps its basis; the new
+        outcome is appended to its interpretations list.
+        """
+        if version is None:
+            version = self.terrain.current_version
+        reinterpreted = 0
+        frozen = 0
+        for record in self.records:
+            plant_time = record["plant_time"]
+            if not (start_time - _EPS <= plant_time <= end_time + _EPS):
+                continue
+            if record["reason"] == OK:
+                frozen += 1
+                continue
+            spec = self.specs[record["foot"]]
+            segment, reason = self._evaluate(
+                spec, record["desired"][0], record["reference_height"],
+                version=version,
+            )
+            record["interpretations"].append({
+                "terrain_version": version,
+                "reason": reason,
+                "status": "satisfied" if reason == OK else "unsatisfied",
+                "position": record["desired"] if reason == OK else None,
+                "height": segment.height if (segment and reason == OK) else None,
+                "segment_id": segment.id if (segment and reason == OK) else None,
+            })
+            reinterpreted += 1
+        return {
+            "reinterpreted": reinterpreted,
+            "frozen": frozen,
+            "terrain_version": version,
+        }
+
+    def retract_observation(self, version: int):
+        """Withdraw a terrain observation and restore pending records.
+
+        Interpretations that were based on the retracted version are
+        dropped, so the affected records fall back to their previous
+        explanation (or to the original pending/unsatisfied basis).
+        Records and feet unrelated to that version are untouched.
+        """
+        self.terrain.retract_observation(version)
+        restored = 0
+        for record in self.records:
+            kept = [
+                entry for entry in record["interpretations"]
+                if entry["terrain_version"] != version
+            ]
+            if len(kept) != len(record["interpretations"]):
+                record["interpretations"] = kept
+                restored += 1
+        return restored
 
     # -- planning --------------------------------------------------------
 
@@ -413,23 +576,41 @@ class FootstepTracker:
     # -- persistence -----------------------------------------------------
 
     def save_state(self) -> dict:
+        terrain = getattr(self.terrain, "save_state", None)
         return {
             "clock": self.clock,
             "reference_height": self.reference_height,
             "marker": self.marker,
+            "derived_until": self._derived_until,
+            "derived_clip": self._derived_clip,
             "feet": {name: dict(foot) for name, foot in self.feet.items()},
-            "records": [dict(record) for record in self.records],
+            "records": [self._copy_record(record) for record in self.records],
+            "terrain": terrain() if callable(terrain) else None,
         }
 
     def load_state(self, data: dict):
         self.clock = data["clock"]
         self.reference_height = data.get("reference_height")
         self.marker = data.get("marker", self.marker)
+        self._derived_until = data.get("derived_until")
+        self._derived_clip = data.get("derived_clip")
         for name, foot in data["feet"].items():
             if name in self.feet:
                 restored = dict(foot)
                 if restored["record"] is not None:
-                    restored["record"] = dict(restored["record"])
+                    restored["record"] = self._copy_record(restored["record"])
                 self.feet[name] = restored
-        self.records = [dict(record) for record in data.get("records", [])]
+        self.records = [
+            self._copy_record(record) for record in data.get("records", [])
+        ]
+        terrain_data = data.get("terrain")
+        if terrain_data is not None and hasattr(self.terrain, "load_state"):
+            self.terrain.load_state(terrain_data)
 
+    @staticmethod
+    def _copy_record(record):
+        copied = dict(record)
+        copied["interpretations"] = [
+            dict(entry) for entry in record.get("interpretations", [])
+        ]
+        return copied

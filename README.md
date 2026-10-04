@@ -47,6 +47,16 @@
 - `compare_plans(n)` 在地面高度或可落脚范围不足时并排给出两个方案：`keep` 保持原步幅（无法达到的落点保留未满足状态），`adjust` 在限定幅度内缩放后续步幅以够到允许片段；两者都只是模拟，不改实现时状态。
 - 保存时一只脚着地、另一只脚腾空也没关系：`save_state()`/`load_state()` 分别保存各自的脚状态与活跃记录，重开后延续各自状态，与未中断播放的接触记录一致。
 
+## 地形观测版本与历史重解释
+
+地形知识以可登记、可撤回的观测版本增长：`terrain.register_observation(segments, note=None)` 提交一次补测（填入新片段补缺口，或以同 id 片段修订高度），返回从 1 开始的版本号；观测按登记顺序叠加在基础层之上，`terrain.snapshot(version)` / `height_at(x, version)` 可复现任意历史版本，`retract_observation(version)` 撤回某次补测且其余版本号保持稳定。
+
+- 每条落脚记录都盖章当时的 `terrain_version` 与参考高度作为依据；登记新观测默认只影响未来落脚，绝不回写历史。
+- `tracker.reinterpret(start, end, version=None)` 用指定（默认最新）地形版本重新评估该墙钟区间内**未满足**的落脚：结果追加到记录的 `interpretations`，原记录保持原样。已确认的支撑是冻结的——不会被静默移动，只在返回值的 `frozen` 计数中报告。
+- 原始记录经 `contact_history()` 查询（保留当时的 no_ground 依据），最新解释经 `interpreted_history()` 查询（含 `basis_reason` / `basis_terrain_version` 与原依据对照）。
+- `tracker.retract_observation(version)` 撤回观测并丢弃基于它的解释，受影响的待定记录自动回落到先前解释或原始待定状态，无关步态不变。
+- 回跳（反向播放或 seek）再前进不会重复产生接触：tracker 按步态相位水位线去重，与播放器事件规则一致；水位线、解释记录与地形观测都随 `save_state()`/`load_state()` 保存，连续运行、事件间存档重开、回跳再前进三种方式得到完全相同的落脚序列。
+
 ## 连续性设计
 
 过渡不是简单平均两个姿态：新切换会先冻结“当前混合结果”的关节值、根速度和角速度，再向目标片段做 smoothstep 混合。根部位移按混合权重对速度积分，循环边界和关键帧边界自动分段，因此在旧过渡未完成时再次切换不会产生位置跳变。
