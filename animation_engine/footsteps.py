@@ -53,10 +53,52 @@ class GroundSegment:
 
 
 class Terrain:
-    """Piecewise-flat ground profile; deliberately editable between runs."""
+    """Piecewise-flat ground profile built from versioned observations.
+
+    Terrain is never edited destructively: every survey is registered as
+    a new observation version (back-filling a gap or revising a height
+    alike), and the current profile is the latest active version.  An
+    observation can be retracted later, which restores the profile to
+    the newest remaining active version.  Contact records store the
+    version they were derived from, so the basis of every historical
+    footstep stays queryable.
+    """
 
     def __init__(self, segments):
-        self.segments = list(segments)
+        self.observations = []
+        self._retracted = set()
+        self.register_observation(segments, note="initial")
+
+    def register_observation(self, segments, note=None) -> int:
+        """Append a survey as a new version and make it current."""
+        version = len(self.observations) + 1
+        self.observations.append({
+            "version": version,
+            "segments": list(segments),
+            "note": note,
+        })
+        return version
+
+    def retract_observation(self, version: int):
+        """Withdraw a survey; the profile falls back to the newest
+        remaining active version.  Unknown versions are ignored."""
+        if 1 <= version <= len(self.observations):
+            self._retracted.add(version)
+
+    @property
+    def version(self) -> int:
+        """The observation version the current profile is based on."""
+        for observation in reversed(self.observations):
+            if observation["version"] not in self._retracted:
+                return observation["version"]
+        return 0
+
+    @property
+    def segments(self):
+        for observation in reversed(self.observations):
+            if observation["version"] not in self._retracted:
+                return observation["segments"]
+        return []
 
     def segment_at(self, x: float):
         for segment in self.segments:
@@ -67,6 +109,46 @@ class Terrain:
     def height_at(self, x: float):
         segment = self.segment_at(x)
         return None if segment is None else segment.height
+
+    def save_state(self) -> dict:
+        return {
+            "observations": [
+                {
+                    "version": item["version"],
+                    "note": item["note"],
+                    "segments": [
+                        {
+                            "id": segment.id,
+                            "x0": segment.x0,
+                            "x1": segment.x1,
+                            "height": segment.height,
+                        }
+                        for segment in item["segments"]
+                    ],
+                }
+                for item in self.observations
+            ],
+            "retracted": sorted(self._retracted),
+        }
+
+    def load_state(self, data: dict):
+        self.observations = [
+            {
+                "version": item["version"],
+                "note": item.get("note"),
+                "segments": [
+                    GroundSegment(
+                        segment["id"],
+                        segment["x0"],
+                        segment["x1"],
+                        segment["height"],
+                    )
+                    for segment in item["segments"]
+                ],
+            }
+            for item in data.get("observations", [])
+        ]
+        self._retracted = set(data.get("retracted", []))
 
 
 @dataclass(frozen=True)
@@ -114,6 +196,10 @@ class FootstepTracker:
         self.clock = 0.0
         # Height reference for step-up checks: last confirmed plant.
         self.reference_height = None
+        # Highest stride-phase already processed; rewinding and moving
+        # forward again never re-fires plant/lift events, mirroring the
+        # player's marker semantics.
+        self._processed_u = None
         # Closed contact records; append-only history.
         self.records = []
 
@@ -187,13 +273,19 @@ class FootstepTracker:
         u1 = (t1 - marker.t) / period
 
         events = []
+        processed = self._processed_u
         for spec in self.specs.values():
             start, end = spec.contact_interval
             for u in self._crossings(u0, u1, start):
+                if processed is not None and u <= processed + _EPS:
+                    continue
                 events.append((u, spec, "plant"))
             for u in self._crossings(u0, u1, end):
+                if processed is not None and u <= processed + _EPS:
+                    continue
                 events.append((u, spec, "lift"))
         events.sort(key=lambda item: item[0])
+        self._processed_u = u1 if processed is None else max(processed, u1)
 
         for u, spec, kind in events:
             t_cross = marker.t + u * period
@@ -254,6 +346,13 @@ class FootstepTracker:
             "reason": reason,
             "slip": 0.0,
             "status": "active",
+            # Basis of the decision: the terrain version and the reference
+            # height in force when the plant was evaluated.  Kept forever,
+            # even if the record is later reinterpreted.
+            "terrain_version": self.terrain.version,
+            "reference_height": self.reference_height,
+            "superseded_by": None,
+            "reinterpreted_from": None,
         }
         foot["record"] = record
         foot["plant_time"] = wall_time
@@ -310,10 +409,127 @@ class FootstepTracker:
             }
         return report
 
-    def contact_history(self):
-        """Closed contact records, oldest first; append-only."""
-        return list(self.records)
+    def contact_history(self, include_superseded: bool = False):
+        """Closed contact records, oldest first; append-only.
 
+        By default only effective records are returned (a record
+        replaced by a reinterpretation is skipped).  Pass
+        include_superseded=True to also see the originals with their
+        historical basis, e.g. the no_ground record a later survey
+        reinterpreted.
+        """
+        if include_superseded:
+            return list(self.records)
+        return [
+            record for record in self.records
+            if record["superseded_by"] is None
+        ]
+
+    # -- terrain observations --------------------------------------------
+
+    def register_observation(self, segments, note=None, mode="future",
+                             since=None, until=None) -> int:
+        """Register a terrain survey as a new version.
+
+        mode="future" (default) only affects plants that have not
+        happened yet; history keeps the basis it was recorded with.
+        mode="reinterpret" additionally re-evaluates pending
+        (unsatisfied) records whose plant_time falls inside
+        [since, until] against the new profile.  Reinterpretation never
+        rewrites the original record: a superseding record is appended
+        and linked, so both the original (e.g. no_ground) and the new
+        interpretation stay queryable.  Confirmed supports — active or
+        satisfied plants — are frozen and never moved silently.
+        """
+        version = self.terrain.register_observation(segments, note=note)
+        if mode == "reinterpret":
+            self.reinterpret_history(since=since, until=until)
+        elif mode != "future":
+            raise ValueError("mode must be 'future' or 'reinterpret'")
+        return version
+
+    def reinterpret_history(self, since=None, until=None) -> list:
+        """Re-evaluate pending records in a plant-time span.
+
+        Only closed, unsatisfied, not-yet-superseded records are
+        eligible; satisfied records and active (frozen) supports are
+        left untouched.  The re-evaluation reuses each record's stored
+        reference height, so the step-up check keeps its original
+        basis.  Returns the newly appended superseding records.
+        """
+        new_records = []
+        for index, record in enumerate(self.records):
+            if record["status"] != "unsatisfied":
+                continue
+            if record["superseded_by"] is not None:
+                continue
+            plant_time = record["plant_time"]
+            if since is not None and plant_time < since - _EPS:
+                continue
+            if until is not None and plant_time > until + _EPS:
+                continue
+            spec = self.specs[record["foot"]]
+            segment, reason = self._evaluate(
+                spec, record["desired"][0], record["reference_height"]
+            )
+            new_height = segment.height if (segment and reason == OK) else None
+            new_segment = segment.id if (segment and reason == OK) else None
+            if (
+                reason == record["reason"]
+                and new_height == record["height"]
+                and new_segment == record["segment_id"]
+            ):
+                continue  # same outcome: nothing to reinterpret
+            superseding = dict(record)
+            superseding.update({
+                "position": record["desired"] if reason == OK else None,
+                "height": new_height,
+                "segment_id": new_segment,
+                "reason": reason,
+                "status": "satisfied" if reason == OK else "unsatisfied",
+                "terrain_version": self.terrain.version,
+                "reinterpreted_from": index,
+                "superseded_by": None,
+            })
+            record["superseded_by"] = len(self.records) + len(new_records)
+            new_records.append(superseding)
+        self.records.extend(new_records)
+        return new_records
+
+    def retract_observation(self, version: int):
+        """Withdraw a survey and undo the reinterpretations based on it.
+
+        Superseding records derived from the retracted version are
+        removed and the originals they replaced become pending
+        (unsatisfied) again.  Records unrelated to that version —
+        including everything recorded under other versions — are not
+        touched.
+        """
+        self.terrain.retract_observation(version)
+        kept = []
+        restored = set()
+        for old_index, record in enumerate(self.records):
+            if (
+                record["terrain_version"] == version
+                and record["reinterpreted_from"] is not None
+            ):
+                restored.add(record["reinterpreted_from"])
+                continue
+            kept.append((old_index, record))
+        # Originals regain their pending status; supersession links are
+        # reindexed against the compacted record list.
+        index_map = {old: new for new, (old, _) in enumerate(kept)}
+        self.records = []
+        for old_index, record in kept:
+            if old_index in restored:
+                record["superseded_by"] = None
+            elif record["superseded_by"] is not None:
+                record["superseded_by"] = index_map.get(record["superseded_by"])
+            if record["reinterpreted_from"] is not None:
+                record["reinterpreted_from"] = index_map.get(
+                    record["reinterpreted_from"]
+                )
+            self.records.append(record)
     # -- planning --------------------------------------------------------
 
     def plan_steps(self, count: int, strategy: str = "keep",
@@ -417,6 +633,7 @@ class FootstepTracker:
             "clock": self.clock,
             "reference_height": self.reference_height,
             "marker": self.marker,
+            "processed_u": self._processed_u,
             "feet": {name: dict(foot) for name, foot in self.feet.items()},
             "records": [dict(record) for record in self.records],
         }
@@ -425,6 +642,7 @@ class FootstepTracker:
         self.clock = data["clock"]
         self.reference_height = data.get("reference_height")
         self.marker = data.get("marker", self.marker)
+        self._processed_u = data.get("processed_u")
         for name, foot in data["feet"].items():
             if name in self.feet:
                 restored = dict(foot)
@@ -432,4 +650,3 @@ class FootstepTracker:
                     restored["record"] = dict(restored["record"])
                 self.feet[name] = restored
         self.records = [dict(record) for record in data.get("records", [])]
-
