@@ -209,6 +209,10 @@ class FootstepTracker:
         # crossings at or below it, mirroring the player event rules.
         self._derived_until = None
         self._derived_clip = None
+        # Monotonic id shared by every review decision (adoption or
+        # withdrawal); persisted so the audit trail stays ordered after
+        # a save/load cycle.
+        self._decision_seq = 0
 
     # -- phase helpers ---------------------------------------------------
 
@@ -436,8 +440,15 @@ class FootstepTracker:
         view["basis_reason"] = record["reason"]
         view["basis_terrain_version"] = record.get("terrain_version")
         view["batch"] = None
-        if record.get("interpretations"):
-            view.update(record["interpretations"][-1])
+        view["reviewer"] = None
+        view["note"] = None
+        live = [
+            entry
+            for entry in record.get("interpretations", [])
+            if not entry.get("withdrawn")
+        ]
+        if live:
+            view.update(live[-1])
         return view
 
     def interpreted_history(self):
@@ -445,7 +456,8 @@ class FootstepTracker:
         return [self.effective_record(record) for record in self.records]
 
     def reinterpret(self, start_time: float, end_time: float,
-                    version: int = None, batch: str = None):
+                    version: int = None, batch: str = None,
+                    note: str = None, reviewer: str = None):
         """Re-evaluate unsatisfied plants in a wall-clock span of history
         against a (possibly newer) terrain version or a named survey batch.
 
@@ -453,7 +465,10 @@ class FootstepTracker:
         frozen and are never silently moved - they are counted in the
         result instead.  The original record keeps its basis; the new
         outcome is appended to its interpretations list together with the
-        source (version and batch) it was derived from.  Positions still
+        source (version and batch), the deciding reviewer and the
+        reviewer's note.  A later reinterpretation of the same span is a
+        new *confirmation* decision; it never erases earlier decisions,
+        which stay visible through ``decision_audit()``.  Positions still
         without any observation stay pending (unsatisfied / no_ground).
         """
         if version is not None and batch is not None:
@@ -480,6 +495,7 @@ class FootstepTracker:
                 version=None if batch is not None else version,
                 batch=batch,
             )
+            self._decision_seq += 1
             record["interpretations"].append({
                 "terrain_version": version,
                 "batch": batch,
@@ -488,6 +504,10 @@ class FootstepTracker:
                 "position": record["desired"] if reason == OK else None,
                 "height": segment.height if (segment and reason == OK) else None,
                 "segment_id": segment.id if (segment and reason == OK) else None,
+                "reviewer": reviewer,
+                "note": note,
+                "sequence": self._decision_seq,
+                "withdrawn": None,
             })
             reinterpreted += 1
         return {
@@ -495,6 +515,84 @@ class FootstepTracker:
             "frozen": frozen,
             "terrain_version": version,
         }
+
+    def withdraw_interpretation(self, start_time: float, end_time: float,
+                                note: str = None, reviewer: str = None,
+                                batch: str = None, version: int = None):
+        """Withdraw the adopted explanation of one wall-clock span only.
+
+        Unlike :meth:`retract_batch` / :meth:`retract_observation`, the
+        underlying terrain observations stay registered: other spans that
+        were explained from the same batch keep their confirmation, and
+        the terrain itself stays reproducible.  Only the currently
+        effective (latest non-withdrawn) interpretation of each record in
+        the span is marked withdrawn - the decision, its reviewer note and
+        the terrain version it was based on are preserved for audit.  The
+        record then falls back to its previous live interpretation or to
+        the original pending basis; no newer observation is applied
+        automatically.  ``batch`` / ``version`` optionally restrict the
+        withdrawal to decisions sourced from that batch or version.
+        """
+        if version is not None and batch is not None:
+            raise ValueError("pass either version or batch, not both")
+        withdrawn = 0
+        for record in self.records:
+            plant_time = record["plant_time"]
+            if not (start_time - _EPS <= plant_time <= end_time + _EPS):
+                continue
+            live = [
+                entry
+                for entry in record["interpretations"]
+                if not entry.get("withdrawn")
+            ]
+            if not live:
+                continue
+            entry = live[-1]
+            if batch is not None and entry.get("batch") != batch:
+                continue
+            if version is not None and entry["terrain_version"] != version:
+                continue
+            self._decision_seq += 1
+            entry["withdrawn"] = {
+                "sequence": self._decision_seq,
+                "reviewer": reviewer,
+                "note": note,
+                "clock": self.clock,
+            }
+            withdrawn += 1
+        return {"withdrawn": withdrawn}
+
+    def decision_audit(self):
+        """Append-only audit trail of per-record review decisions.
+
+        Every adoption (reinterpretation / re-confirmation) is listed in
+        order; withdrawn decisions keep their reviewer note and the
+        terrain version they were based on and carry the withdrawal
+        marker.  The trail is the traceable counterpart of
+        :meth:`interpreted_history`, which only shows live decisions.
+        """
+        audit = []
+        for record in self.records:
+            decisions = []
+            for entry in record.get("interpretations", []):
+                decisions.append({
+                    "sequence": entry.get("sequence"),
+                    "terrain_version": entry["terrain_version"],
+                    "batch": entry.get("batch"),
+                    "reason": entry["reason"],
+                    "status": entry["status"],
+                    "reviewer": entry.get("reviewer"),
+                    "note": entry.get("note"),
+                    "withdrawn": entry.get("withdrawn"),
+                })
+            audit.append({
+                "foot": record["foot"],
+                "plant_time": record["plant_time"],
+                "basis_reason": record["reason"],
+                "basis_terrain_version": record.get("terrain_version"),
+                "decisions": decisions,
+            })
+        return audit
 
     def retract_observation(self, version: int):
         """Withdraw a terrain observation and restore pending records.
@@ -647,6 +745,7 @@ class FootstepTracker:
             "marker": self.marker,
             "derived_until": self._derived_until,
             "derived_clip": self._derived_clip,
+            "decision_seq": self._decision_seq,
             "feet": {name: dict(foot) for name, foot in self.feet.items()},
             "records": [self._copy_record(record) for record in self.records],
             "terrain": terrain() if callable(terrain) else None,
@@ -658,6 +757,7 @@ class FootstepTracker:
         self.marker = data.get("marker", self.marker)
         self._derived_until = data.get("derived_until")
         self._derived_clip = data.get("derived_clip")
+        self._decision_seq = data.get("decision_seq", 0)
         for name, foot in data["feet"].items():
             if name in self.feet:
                 restored = dict(foot)

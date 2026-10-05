@@ -444,6 +444,195 @@ class BatchPersistenceTest(unittest.TestCase):
     """Pending conflicts survive save/load; rewind and replay stay
     identical to continuous playback in count, source and outcome."""
 
+
+class PartialWithdrawalTest(unittest.TestCase):
+    """A reviewer withdraws the adoption decision for one span only,
+    without retracting the survey batch behind the other span."""
+
+    def setUp(self):
+        self.terrain = gapped_terrain()
+        self.player, self.tracker = make_tracker(self.terrain)
+        run(self.tracker, 3.0)
+        self.gap_records = [
+            r for r in self.tracker.contact_history()
+            if r["reason"] == "no_ground"
+        ]
+        self.assertGreaterEqual(len(self.gap_records), 2)
+        # One resurvey batch covers two separate landing spans, with the
+        # latest version numbering each record adopts.
+        self.version = self.terrain.register_observation(
+            [GroundSegment("deck", 2.0, 3.0, 0.4)], batch="resurvey"
+        )
+        times = sorted(r["plant_time"] for r in self.gap_records)
+        k = len(times) // 2
+        self.mid = (times[k - 1] + times[k]) / 2
+        self.earlier = [t for t in times if t <= self.mid]
+        self.later = [t for t in times if t > self.mid]
+        self.assertTrue(self.earlier)
+        self.assertTrue(self.later)
+        self.tracker.reinterpret(
+            0.0, self.mid, batch="resurvey",
+            reviewer="alice", note="deck fills the first gap",
+        )
+        self.tracker.reinterpret(
+            self.mid, self.tracker.clock, batch="resurvey",
+            reviewer="alice", note="same deck carries the second gap",
+        )
+
+    def _views(self):
+        return {
+            r["plant_time"]: r
+            for r in self.tracker.interpreted_history()
+        }
+
+    def test_withdraw_one_span_keeps_sibling_confirmation(self):
+        result = self.tracker.withdraw_interpretation(
+            0.0, self.mid, reviewer="bob", note="alice misread the span"
+        )
+        self.assertEqual(result["withdrawn"], len(self.earlier))
+
+        # The resurvey batch itself is still fully registered: nothing
+        # was retracted from the terrain.
+        self.assertEqual(
+            self.terrain.batch_versions("resurvey"), [self.version]
+        )
+        self.assertEqual(
+            self.terrain.height_at(2.5, batch="resurvey"), 0.4
+        )
+
+        views = self._views()
+        for plant_time in self.earlier:
+            view = views[plant_time]
+            # Withdrawn span falls back to its original pending basis;
+            # no newer observation is auto-applied.
+            self.assertEqual(view["reason"], "no_ground")
+            self.assertEqual(view["status"], "unsatisfied")
+            self.assertIsNone(view["position"])
+            self.assertIsNone(view["batch"])
+            self.assertEqual(view["basis_terrain_version"], 0)
+        for plant_time in self.later:
+            view = views[plant_time]
+            # The other span's confirmation survives untouched.
+            self.assertEqual(view["batch"], "resurvey")
+            self.assertEqual(view["terrain_version"], self.version)
+            self.assertEqual(view["reason"], "ok")
+            self.assertEqual(view["reviewer"], "alice")
+            self.assertEqual(view["note"], "same deck carries the second gap")
+            self.assertAlmostEqual(view["height"], 0.4)
+
+        # The withdrawn decision itself is preserved with its operator
+        # note and the observation version it relied on.
+        audit = {
+            item["plant_time"]: item for item in self.tracker.decision_audit()
+        }
+        for plant_time in self.earlier:
+            decisions = audit[plant_time]["decisions"]
+            self.assertEqual(len(decisions), 1)
+            decision = decisions[0]
+            self.assertTrue(decision["withdrawn"])
+            self.assertEqual(decision["reviewer"], "alice")
+            self.assertEqual(decision["note"], "deck fills the first gap")
+            self.assertEqual(decision["terrain_version"], self.version)
+            self.assertEqual(decision["batch"], "resurvey")
+            self.assertEqual(decision["withdrawn"]["reviewer"], "bob")
+            self.assertEqual(
+                decision["withdrawn"]["note"], "alice misread the span"
+            )
+        for plant_time in self.later:
+            self.assertFalse(audit[plant_time]["decisions"][0]["withdrawn"])
+
+    def test_conflicting_observation_does_not_auto_support_withdrawn_span(self):
+        self.tracker.withdraw_interpretation(
+            0.0, self.mid, reviewer="bob", note="span disputed"
+        )
+        # Registering a contradictory survey must not silently re-explain
+        # the withdrawn span.
+        self.terrain.register_observation(
+            [GroundSegment("deck", 2.0, 3.0, 9.9)], batch="contradiction"
+        )
+        views = self._views()
+        for plant_time in self.earlier:
+            self.assertEqual(views[plant_time]["reason"], "no_ground")
+            self.assertIsNone(views[plant_time]["batch"])
+        for plant_time in self.later:
+            # Still the resurvey confirmation, not the new height.
+            self.assertEqual(views[plant_time]["batch"], "resurvey")
+            self.assertAlmostEqual(views[plant_time]["height"], 0.4)
+
+    def test_reconfirm_after_withdrawal_is_separate_decision(self):
+        self.tracker.withdraw_interpretation(
+            0.0, self.mid, reviewer="bob", note="re-survey needed"
+        )
+        self.tracker.reinterpret(
+            0.0, self.mid, batch="resurvey",
+            reviewer="carol", note="rechecked, deck really is there",
+        )
+        views = self._views()
+        for plant_time in self.earlier:
+            view = views[plant_time]
+            self.assertEqual(view["reason"], "ok")
+            self.assertEqual(view["batch"], "resurvey")
+            self.assertEqual(view["reviewer"], "carol")
+
+        audit = {
+            item["plant_time"]: item for item in self.tracker.decision_audit()
+        }
+        for plant_time in self.earlier:
+            decisions = audit[plant_time]["decisions"]
+            self.assertEqual(len(decisions), 2)
+            self.assertTrue(decisions[0]["withdrawn"])
+            self.assertEqual(decisions[0]["reviewer"], "alice")
+            self.assertFalse(decisions[1]["withdrawn"])
+            self.assertEqual(decisions[1]["reviewer"], "carol")
+            self.assertEqual(
+                decisions[1]["terrain_version"], self.version
+            )
+
+    def test_withdrawal_survives_save_reload_and_rewind_replay(self):
+        self.tracker.withdraw_interpretation(
+            0.0, self.mid, reviewer="bob", note="span disputed"
+        )
+        saved_player = self.player.save_state()
+        saved_tracker = self.tracker.save_state()
+
+        library = build_demo_library()
+        player2 = AnimationPlayer(library, "walk")
+        tracker2 = FootstepTracker(player2, make_feet(), self.terrain)
+        player2.load_state(saved_player)
+        tracker2.load_state(saved_tracker)
+
+        # Rewind over contacts and play forward again: no duplicate
+        # decisions and the withdrawn span stays pending while the other
+        # span stays confirmed.
+        tracker2.update(-0.9)
+        tracker2.update(0.9)
+        assert_interpreted_almost_equal(
+            self,
+            self.tracker.interpreted_history(),
+            tracker2.interpreted_history(),
+        )
+        audit_a = self.tracker.decision_audit()
+        audit_b = tracker2.decision_audit()
+        self.assertEqual(
+            [len(item["decisions"]) for item in audit_a],
+            [len(item["decisions"]) for item in audit_b],
+        )
+        for item_a, item_b in zip(audit_a, audit_b):
+            self.assertEqual(item_a["decisions"], item_b["decisions"])
+
+        # The sibling span can still be withdrawn independently after
+        # reload, and the resurvey batch is never auto-retracted.
+        result = tracker2.withdraw_interpretation(
+            self.mid, tracker2.clock, reviewer="bob", note="other span out"
+        )
+        self.assertEqual(result["withdrawn"], len(self.later))
+        self.assertEqual(
+            self.terrain.batch_versions("resurvey"), [self.version]
+        )
+        for view in tracker2.interpreted_history():
+            if view["basis_reason"] == "no_ground":
+                self.assertEqual(view["reason"], "no_ground")
+
     def scenario(self, rewind=False, snapshots=False):
         terrain = gapped_terrain()
         player, tracker = make_tracker(terrain)
