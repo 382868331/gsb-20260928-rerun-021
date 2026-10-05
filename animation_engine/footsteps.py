@@ -362,6 +362,9 @@ class FootstepTracker:
             "reference_height": self.reference_height,
             # Re-interpretations registered afterwards, newest last.
             "interpretations": [],
+            # Decisions withdrawn by interval-scoped retraction, oldest
+            # last; each keeps the original note and basis version.
+            "retracted": [],
         }
         foot["record"] = record
         foot["plant_time"] = wall_time
@@ -445,7 +448,8 @@ class FootstepTracker:
         return [self.effective_record(record) for record in self.records]
 
     def reinterpret(self, start_time: float, end_time: float,
-                    version: int = None, batch: str = None):
+                    version: int = None, batch: str = None,
+                    note: str = None):
         """Re-evaluate unsatisfied plants in a wall-clock span of history
         against a (possibly newer) terrain version or a named survey batch.
 
@@ -453,8 +457,9 @@ class FootstepTracker:
         frozen and are never silently moved - they are counted in the
         result instead.  The original record keeps its basis; the new
         outcome is appended to its interpretations list together with the
-        source (version and batch) it was derived from.  Positions still
-        without any observation stay pending (unsatisfied / no_ground).
+        source (version and batch) it was derived from and the operator
+        note justifying the decision.  Positions still without any
+        observation stay pending (unsatisfied / no_ground).
         """
         if version is not None and batch is not None:
             raise ValueError("pass either version or batch, not both")
@@ -483,6 +488,7 @@ class FootstepTracker:
             record["interpretations"].append({
                 "terrain_version": version,
                 "batch": batch,
+                "note": note,
                 "reason": reason,
                 "status": "satisfied" if reason == OK else "unsatisfied",
                 "position": record["desired"] if reason == OK else None,
@@ -495,6 +501,61 @@ class FootstepTracker:
             "frozen": frozen,
             "terrain_version": version,
         }
+
+    def retract_interpretation(self, start_time: float, end_time: float,
+                               batch: str = None, note: str = None):
+        """Withdraw adopted interpretations in a wall-clock span only.
+
+        Unlike :meth:`retract_batch`, the underlying observations stay
+        registered: only the reviewer decision for records whose plant
+        time falls inside [start_time, end_time] is withdrawn, so other
+        spans explained from the same batch keep their confirmation.
+        With ``batch`` set, only decisions adopted from that batch are
+        eligible.  Each withdrawal pops the record's latest
+        interpretation; the withdrawn decision - including the operator
+        note and the observation version it was based on - is kept on
+        the record under ``retracted`` together with the retraction
+        note, so the full audit trail survives save/load.  Affected
+        records fall back to their previous interpretation or original
+        pending basis and can be confirmed again via
+        :meth:`reinterpret`.
+        """
+        withdrawn = 0
+        for record in self.records:
+            plant_time = record["plant_time"]
+            if not (start_time - _EPS <= plant_time <= end_time + _EPS):
+                continue
+            if not record["interpretations"]:
+                continue
+            latest = record["interpretations"][-1]
+            if batch is not None and latest.get("batch") != batch:
+                continue
+            record["interpretations"].pop()
+            record.setdefault("retracted", []).append({
+                "note": note,
+                "decision": latest,
+            })
+            withdrawn += 1
+        return withdrawn
+
+    def retraction_log(self):
+        """Audit trail of locally withdrawn decisions, oldest first.
+
+        Each entry names the record (foot and plant time), the
+        retraction note and the withdrawn decision itself - with the
+        original operator note, source batch and terrain version - so a
+        retracted-and-reconfirmed span stays fully traceable.
+        """
+        log = []
+        for record in self.records:
+            for entry in record.get("retracted", []):
+                log.append({
+                    "foot": record["foot"],
+                    "plant_time": record["plant_time"],
+                    "note": entry["note"],
+                    "decision": dict(entry["decision"]),
+                })
+        return log
 
     def retract_observation(self, version: int):
         """Withdraw a terrain observation and restore pending records.
@@ -676,5 +737,9 @@ class FootstepTracker:
         copied = dict(record)
         copied["interpretations"] = [
             dict(entry) for entry in record.get("interpretations", [])
+        ]
+        copied["retracted"] = [
+            {"note": entry["note"], "decision": dict(entry["decision"])}
+            for entry in record.get("retracted", [])
         ]
         return copied

@@ -562,5 +562,186 @@ class BatchPersistenceTest(unittest.TestCase):
         self.assertEqual(len(pending), len(pending_before) + len(explained_b))
 
 
+
+
+class PartialRetractionTest(unittest.TestCase):
+    """A reviewer withdraws the adopted decision for one time span only,
+    without retracting the whole survey batch, then re-confirms the span
+    against a contradictory observation."""
+
+    def setUp(self):
+        # Wide gap (x 2.0..6.0) so each time span holds several plants.
+        self.terrain = Terrain([
+            GroundSegment("near", -10.0, 2.0, 0.0),
+            GroundSegment("far", 6.0, 100.0, 0.0),
+        ])
+        self.player, self.tracker = make_tracker(self.terrain)
+        run(self.tracker, 8.0)
+        self.gap_records = [
+            r for r in self.tracker.contact_history()
+            if r["reason"] == "no_ground"
+        ]
+        self.assertGreaterEqual(len(self.gap_records), 2)
+        # One batch covers the plants of both spans.
+        self.terrain.register_observation(
+            [GroundSegment("deck", 2.0, 6.0, 0.4)], batch="survey_a"
+        )
+        times = sorted(r["plant_time"] for r in self.gap_records)
+        k = len(times) // 2
+        self.mid = (times[k - 1] + times[k]) / 2.0
+        self.tracker.reinterpret(
+            0.0, self.tracker.clock, batch="survey_a",
+            note="reviewer A: adopt survey_a",
+        )
+
+    def views(self, tracker=None):
+        tracker = tracker or self.tracker
+        return {
+            r["plant_time"]: r for r in tracker.interpreted_history()
+        }
+
+    def early_records(self):
+        return [
+            r for r in self.gap_records if r["plant_time"] < self.mid
+        ]
+
+    def late_records(self):
+        return [
+            r for r in self.gap_records if r["plant_time"] >= self.mid
+        ]
+
+    def test_partial_retraction_keeps_batch_and_sibling_span(self):
+        withdrawn = self.tracker.retract_interpretation(
+            self.mid, self.tracker.clock,
+            note="reviewer B: withdraw later span",
+        )
+        self.assertEqual(withdrawn, len(self.late_records()))
+        # The batch itself stays registered; only the span decision went.
+        self.assertEqual(self.terrain.batch_versions("survey_a"), [1])
+        self.assertEqual(self.terrain.height_at(3.0), 0.4)
+
+        views = self.views()
+        for record in self.early_records():
+            view = views[record["plant_time"]]
+            self.assertEqual(view["reason"], "ok")
+            self.assertEqual(view["batch"], "survey_a")
+            self.assertAlmostEqual(view["height"], 0.4)
+        for record in self.late_records():
+            view = views[record["plant_time"]]
+            self.assertEqual(view["reason"], "no_ground")
+            self.assertEqual(view["status"], "unsatisfied")
+            self.assertIsNone(view["batch"])
+
+        # The withdrawn decision stays traceable: operator note and the
+        # observation version it was based on are both preserved.
+        log = self.tracker.retraction_log()
+        self.assertEqual(len(log), withdrawn)
+        for entry in log:
+            self.assertEqual(entry["note"], "reviewer B: withdraw later span")
+            self.assertEqual(
+                entry["decision"]["note"], "reviewer A: adopt survey_a"
+            )
+            self.assertEqual(entry["decision"]["batch"], "survey_a")
+            self.assertEqual(entry["decision"]["terrain_version"], 1)
+
+    def test_reconfirm_contradiction_survives_save_load_and_rewind(self):
+        self.tracker.retract_interpretation(
+            self.mid, self.tracker.clock,
+            note="reviewer B: withdraw later span",
+        )
+        # Contradictory survey covering only part of the gap.
+        self.terrain.register_observation(
+            [GroundSegment("deck", 3.5, 5.0, 0.9)], batch="survey_b"
+        )
+        self.tracker.reinterpret(
+            self.mid, self.tracker.clock, batch="survey_b",
+            note="reviewer B: re-confirm with survey_b",
+        )
+        saved = (self.player.save_state(), self.tracker.save_state())
+        run(self.tracker, 1.2)
+
+        library = build_demo_library()
+        player2 = AnimationPlayer(library, "walk")
+        tracker2 = FootstepTracker(player2, make_feet(), Terrain([
+            GroundSegment("near", -10.0, 2.0, 0.0),
+            GroundSegment("far", 6.0, 100.0, 0.0),
+        ]))
+        player2.load_state(saved[0])
+        tracker2.load_state(saved[1])
+        # Rewind across derived contacts, then replay forward.
+        tracker2.update(-0.9)
+        tracker2.update(0.9)
+        run(tracker2, 1.2)
+
+        assert_records_almost_equal(
+            self, self.tracker.contact_history(), tracker2.contact_history()
+        )
+        assert_interpreted_almost_equal(
+            self,
+            self.tracker.interpreted_history(),
+            tracker2.interpreted_history(),
+        )
+        self.assertEqual(
+            self.tracker.retraction_log(), tracker2.retraction_log()
+        )
+
+        views = self.views(tracker2)
+        # The sibling span confirmation was not lost.
+        for record in self.early_records():
+            view = views[record["plant_time"]]
+            self.assertEqual(view["reason"], "ok")
+            self.assertEqual(view["batch"], "survey_a")
+            self.assertAlmostEqual(view["height"], 0.4)
+        # The re-confirmed span follows survey_b only where it actually
+        # observes ground; unobserved positions stay pending instead of
+        # gaining support automatically.
+        reconfirmed = 0
+        still_pending = 0
+        for record in self.late_records():
+            view = views[record["plant_time"]]
+            observed = self.terrain.height_at(
+                record["desired"][0], batch="survey_b"
+            )
+            if observed is None:
+                self.assertEqual(view["reason"], "no_ground")
+                self.assertEqual(view["status"], "unsatisfied")
+                self.assertIsNone(view["position"])
+                still_pending += 1
+            else:
+                self.assertEqual(view["reason"], "ok")
+                self.assertEqual(view["batch"], "survey_b")
+                self.assertAlmostEqual(view["height"], 0.9)
+                reconfirmed += 1
+        self.assertGreater(reconfirmed, 0)
+        self.assertGreater(still_pending, 0)
+
+    def test_retraction_log_survives_save_load(self):
+        self.tracker.retract_interpretation(
+            self.mid, self.tracker.clock, note="withdraw later span",
+        )
+        saved = (self.player.save_state(), self.tracker.save_state())
+        library = build_demo_library()
+        player2 = AnimationPlayer(library, "walk")
+        tracker2 = FootstepTracker(player2, make_feet(), Terrain([
+            GroundSegment("near", -10.0, 2.0, 0.0),
+            GroundSegment("far", 6.0, 100.0, 0.0),
+        ]))
+        player2.load_state(saved[0])
+        tracker2.load_state(saved[1])
+        self.assertEqual(
+            self.tracker.retraction_log(), tracker2.retraction_log()
+        )
+        # The reloaded tracker can re-confirm the withdrawn span.
+        tracker2.reinterpret(
+            self.mid, tracker2.clock, batch="survey_a",
+            note="reviewer C: re-adopt survey_a",
+        )
+        views = self.views(tracker2)
+        for record in self.late_records():
+            view = views[record["plant_time"]]
+            self.assertEqual(view["reason"], "ok")
+            self.assertEqual(view["batch"], "survey_a")
+
+
 if __name__ == "__main__":
     unittest.main()
